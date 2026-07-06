@@ -73,6 +73,12 @@ def write_hard_negative_audit(artifact_dir, split, df):
     return summary
 
 
+def write_skip_report(artifact_dir, split, rows):
+    cols = ["split", "sample_name", "window_idx", "reason", "detail"]
+    path = os.path.join(artifact_dir, f"skipped_error_features_{split}.csv")
+    pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
+
+
 def _prewindow_to_25hz(sample, window, window_sec):
     n = int(window.shape[0])
     if (_is_25hz_sample(sample) or n == int(round(float(window_sec) * FEATURE_FS))
@@ -104,26 +110,46 @@ def main():
         if not os.path.exists(cp): print(f"[{name}] Skipped"); continue
         comm = pd.read_csv(cp)
         errors = comm[(comm["pred"] == 1) & (comm["fallback"] == False) & (comm["stage2_enabled"] == True)]
-        if len(errors) == 0: print(f"[{name}] No commercial-positive candidates"); continue
-        rows, ok, skip = [], 0, 0
+        if len(errors) == 0:
+            print(f"[{name}] No commercial-positive candidates")
+            write_skip_report(args.artifact_dir, name, [])
+            write_hard_negative_audit(args.artifact_dir, name, pd.DataFrame())
+            continue
+        rows, skip_rows, ok, skip = [], [], 0, 0
         for _, row in errors.iterrows():
             sn, widx = row["sample_name"], int(row["window_idx"])
             sample = sn_map.get(sn)
-            if sample is None: skip += 1; continue
+            if sample is None:
+                skip += 1
+                skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                  "reason": "sample_not_found", "detail": ""})
+                continue
             try: ppg, acc = load_ppg(sample), load_acc(sample)
-            except Exception: skip += 1; continue
+            except Exception as exc:
+                skip += 1
+                skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                  "reason": "load_signal_failed", "detail": str(exc)})
+                continue
             try:
                 score = float(row["score"]) if pd.notna(row["score"]) else -2000.0
                 if is_prewindowed_signal(ppg):
                     mode = detect_green_mode(ppg)
-                    if widx >= ppg.shape[0]: skip += 1; continue
+                    if widx >= ppg.shape[0]:
+                        skip += 1
+                        skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                          "reason": "window_index_out_of_bounds", "detail": f"n_windows={ppg.shape[0]}"})
+                        continue
                     win25, _ = _prewindow_to_25hz(sample, ppg[widx], 5.0)
                     ir, amb, g1, g2, g3 = get_channels_from_window(win25, mode)
                     feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
                 else:
                     ppg25, acc25, _ = _to_25hz(sample, ppg, acc); mode = detect_green_mode(ppg)
                     sw, ss = int(round(5.0 * FEATURE_FS)), int(round(1.0 * FEATURE_FS))
-                    if widx * ss + sw > len(ppg25): skip += 1; continue
+                    if widx * ss + sw > len(ppg25):
+                        skip += 1
+                        skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                          "reason": "window_slice_out_of_range", "detail": f"signal_len={len(ppg25)}"})
+                        continue
                     win = ppg25[widx * ss:widx * ss + sw, :]
                     ir, amb, g1, g2, g3 = get_channels_from_window(win, mode)
                     feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
@@ -132,11 +158,15 @@ def main():
                      "commercial_pred": int(row["pred"]), "window_idx": widx,
                      "commercial_score": score, "is_error": int(row["is_error"])}
                 r.update(feats); rows.append(r); ok += 1
-            except Exception: skip += 1
+            except Exception as exc:
+                skip += 1
+                skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                  "reason": "feature_extraction_failed", "detail": str(exc)})
         print(f"[{name}] Extracted={ok} skipped={skip}")
         df = pd.DataFrame(rows)
         if rows:
             df.to_csv(os.path.join(args.artifact_dir, f"error_features_{name}.csv"), index=False)
+        write_skip_report(args.artifact_dir, name, skip_rows)
         write_hard_negative_audit(args.artifact_dir, name, df)
     print(f"Done ({time.time()-t0:.1f}s)")
 

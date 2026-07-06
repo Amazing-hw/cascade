@@ -157,9 +157,14 @@ def main():
     train_args = ["--artifact_dir", paths["artifact_dir"], "--n_estimators", str(args.n_estimators), "--max_depth", str(args.max_depth)]
     if args.manual_features:
         train_args += ["--manual_features", _abs_path(args.manual_features, d)]
+    s05_args = [
+        "--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"],
+        "--dc_threshold", str(args.dc_threshold),
+    ]
+    if args.n_workers is not None:
+        s05_args += ["--n_workers", str(args.n_workers)]
     steps = [
-        ("S05-Run commercial", os.path.join(d, "s05_run_commercial.py"),
-         ["--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"], "--dc_threshold", str(args.dc_threshold)]),
+        ("S05-Run commercial", os.path.join(d, "s05_run_commercial.py"), s05_args),
         ("S06-Extract errors", os.path.join(d, "s06_extract_errors.py"),
          ["--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"]]),
         ("S07-Select features", os.path.join(d, "s07_select_features.py"),

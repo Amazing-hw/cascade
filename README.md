@@ -4,6 +4,99 @@
 
 这个方案适合优先降低“误判佩戴”的商业风险。它不会把商用模型判为未佩戴的样本改成佩戴，只会在商用模型已经判为佩戴的样本中，额外识别是否存在高风险非佩戴样本。
 
+## 新手快速上手
+
+如果你第一次接触这个项目，先按这一节跑通最小流程，再看后面的原理和产物说明。
+
+### 1. 准备目录
+
+把整个 `cascade/` 文件夹拷贝到任意位置都可以运行。推荐目录关系如下：
+
+```text
+your_workspace/
+    cascade/
+        s01_model.py
+        s10_pipeline.py
+        README.md
+        ...
+    dataset/
+        sample_001.h5
+        sample_002.h5
+        ...
+```
+
+`dataset/` 不一定要放在 `cascade/` 旁边，也可以放在任意磁盘路径，运行时用 `--dataset_dir` 指向它即可。
+
+### 2. 安装 Python 依赖
+
+建议使用 Python 3.9+。在你的 Python 环境中安装：
+
+```bash
+pip install numpy pandas scipy scikit-learn xgboost h5py joblib matplotlib
+```
+
+可选安装 Graphviz，用于把树结构导出为 PNG。如果没有 Graphviz，项目仍然会输出 `tree_*.json`、`tree_*.dot` 和 `all_trees.txt`。
+
+### 3. 先做 dry-run
+
+进入 `cascade/` 目录：
+
+```bash
+cd path\to\cascade
+```
+
+先检查命令链路，不真正跑数据：
+
+```bash
+python s10_pipeline.py --dataset_dir path\to\dataset --dry_run
+```
+
+如果 dry-run 能打印 S05/S06/S07/S08/S09 的命令，说明入口脚本和参数基本正常。
+
+### 4. 跑最小完整流程
+
+推荐先用 `shadow`，因为它不会改变商用输出，只记录新增风险分析：
+
+```bash
+python s10_pipeline.py --dataset_dir path\to\dataset --guard_mode shadow
+```
+
+需要解释性图片和树结构时再加：
+
+```bash
+python s10_pipeline.py --dataset_dir path\to\dataset --guard_mode shadow --explain
+```
+
+运行结束后先看这几个文件：
+
+```text
+artifacts/cascade/commercial_model_manifest.json
+artifacts/cascade/evaluation_report.json
+artifacts/cascade/evaluation_comparison.csv
+artifacts/cascade/feature_review/ranked_features.md
+artifacts/cascade/hard_negative_audit/
+```
+
+需要交给工程化同事时，导出独立部署包：
+
+```bash
+python s12_export_deploy.py --artifact_dir artifacts/cascade
+```
+
+默认会生成：
+
+```text
+artifacts/cascade/deploy_export/
+```
+
+### 5. 最重要的理解
+
+- `commercial_pred`：只依赖原商用模型的结果。
+- `cascade_pred`：商用模型后面增加守护层后的完整方案结果。
+- `shadow`：只记录风险，不改变最终输出。
+- `hard negative`：真实非佩戴，但商用模型判成佩戴，是本方案最关注的错误。
+- `commercial_model_manifest.json`：证明商用特征和模型参数没有被修改。
+
 ## 0. 先看这一节：如何理解整个项目
 
 这一节用于快速建立全局认识。后面的章节会逐个解释代码文件、参数、产物和使用方法。
@@ -42,7 +135,8 @@ flowchart TD
 
 - split 在 `S05` 之前完成。`S10` 会先生成或复用 `splits.json`，然后才运行商用模型。
 - 如果已经存在 `splits.json`，默认不会重新划分，所以日志中会显示复用 split。
-- `S05` 时间较长，因为它要逐样本、逐窗口运行冻结商用模型；当前已经增加进度输出。
+- `S05` 时间较长，因为它要逐样本、逐窗口运行冻结商用模型；当前已经增加进度输出，并支持按样本并行。
+- `S05` 的并行策略是保守的：默认小于 32 个样本的 split 仍串行，避免 Windows 多进程启动开销；样本数较大时自动启用最多 4 个 worker，也可以通过 `--n_workers` 显式指定。
 
 ### 0.3 商用模型冻结边界图
 
@@ -171,6 +265,7 @@ figures/*.png
 tree_export/*
 error_trace/*
 hard_negative_audit/*
+skipped_error_features_*.csv
 ```
 
 注意：`tree_*.png` 依赖系统安装 Graphviz `dot`。如果没有 Graphviz，项目仍会输出 `tree_*.json`、`tree_*.dot` 和 `all_trees.txt`，可解释信息不会丢失。
@@ -460,7 +555,12 @@ artifacts/cascade/error_features_train.csv
 artifacts/cascade/error_features_valid.csv
 artifacts/cascade/error_features_test.csv
 artifacts/cascade/hard_negative_audit/*
+artifacts/cascade/skipped_error_features_train.csv
+artifacts/cascade/skipped_error_features_valid.csv
+artifacts/cascade/skipped_error_features_test.csv
 ```
+
+`skipped_error_features_*.csv` 会记录商用阳性候选窗口没有成功抽取特征的原因，例如样本未找到、信号读取失败、窗口越界或特征抽取失败。它用于解释 hard negative 候选数和最终 `error_features_*.csv` 行数不一致的情况。
 
 ### `s07_select_features.py`
 
@@ -561,6 +661,32 @@ artifacts/cascade/error_trace/*
 artifacts/cascade/commercial_filter_report/*
 ```
 
+### `s12_export_deploy.py`
+
+部署交接包导出脚本。它把训练产物和部署参考脚本整理成一个可独立传递的目录：
+
+```text
+artifacts/cascade/deploy_export/
+```
+
+主要输出：
+
+```text
+model.json
+method.json
+selected_features.json
+fill_values.json
+commercial_model_manifest.json
+feature_extractor.py
+s02_features.py
+commercial_model.py
+deploy_inference.py
+README_DEPLOY.md
+deploy_manifest.json
+```
+
+`method.json` 是核心方法配置，包含特征顺序、缺失值填充值、阈值、guard 模式、串联策略和商用模型冻结信息。
+
 ## 7. 快速运行
 
 进入项目目录：
@@ -579,6 +705,18 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --dry_run
 
 ```bash
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain
+```
+
+指定 worker 数运行。`--n_workers` 会用于首次扫描 H5 数据，也会传给 `S05` 做样本级并行：
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 4
+```
+
+如果数据量较小，建议保持默认或显式使用串行，避免多进程启动开销：
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 1
 ```
 
 重新生成 split：
@@ -709,6 +847,26 @@ hard negative 审计报告。重点看：
 - 这些样本来自哪些 sample。
 - hard negative 在候选集中的占比。
 
+### `skipped_error_features_*.csv`
+
+串联候选特征提取跳过报告。每行包含：
+
+- `split`
+- `sample_name`
+- `window_idx`
+- `reason`
+- `detail`
+
+常见 `reason` 包括：
+
+- `sample_not_found`
+- `load_signal_failed`
+- `window_index_out_of_bounds`
+- `window_slice_out_of_range`
+- `feature_extraction_failed`
+
+这个文件用于定位数据质量、窗口索引或特征抽取异常，不参与模型训练。
+
 ### `feature_review/`
 
 特征排序和人工选择材料。用于解释为什么选择某些特征进入新增小模型。
@@ -758,6 +916,25 @@ hard negative 审计报告。重点看：
 - `error_path_node_frequency.png`
 
 用于回答：错误样本是在哪些树节点、哪些分支上逃出的。
+
+### `deploy_export/`
+
+端侧或工程化交接目录。重点文件：
+
+- `model.json`：新增串联守护模型。
+- `method.json`：完整部署方法配置。
+- `feature_extractor.py`：部署参考特征提取脚本。
+- `s02_features.py`：兼容文件名，保证 `commercial_model.py` 内部导入可用。
+- `commercial_model.py`：冻结商用模型脚本。
+- `commercial_model_manifest.json`：商用冻结证据。
+- `deploy_inference.py`：最小 Python 推理参考。
+- `deploy_manifest.json`：文件清单和 SHA256。
+
+导出命令：
+
+```bash
+python s12_export_deploy.py --artifact_dir artifacts/cascade
+```
 
 ## 11. 推荐使用路径
 
@@ -1081,6 +1258,7 @@ figures/*.png
 tree_export/*
 error_trace/*
 hard_negative_audit/*
+skipped_error_features_*.csv
 ```
 
 这样可以完整复现：数据怎么切、特征怎么排、人工选了哪些特征、模型怎么训、最终效果如何、错误样本为什么错。
