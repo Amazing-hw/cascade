@@ -1,0 +1,56 @@
+{
+  "model_type": "constant_veto_guard",
+  "label_col": "should_veto",
+  "reason": "single_class_training_labels",
+  "constant_probability": 1.0,
+  "n_estimators": 0,
+  "max_depth": 0,
+  "n_nodes": 0,
+  "threshold_objective": "constant_single_class_fallback",
+  "feature_source": {
+    "source": "manual",
+    "path": "artifacts_deploy_check_20260705\\cascade\\feature_review\\manual_feature_selection.json",
+    "payload": {
+      "selected_features": [
+        "commercial_score"
+      ],
+      "feature_source": "manual_deploy_check",
+      "notes": "Generated during deployment verification from selected_features.json"
+    }
+  },
+  "selected_features": [
+    "commercial_score"
+  ],
+  "threshold": 0.5,
+  "fill_values": {
+    "commercial_score": -2000.0
+  },
+  "train_metrics": {
+    "n": 56,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "auc": 0.5,
+    "confusion": {
+      "TN": 0,
+      "FP": 0,
+      "FN": 0,
+      "TP": 56
+    }
+  },
+  "valid_metrics": {
+    "n": 14,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "auc": 0.5,
+    "confusion": {
+      "TN": 0,
+      "FP": 0,
+      "FN": 0,
+      "TP": 14
+    }
+  }
+}

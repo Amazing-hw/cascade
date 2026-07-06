@@ -1,0 +1,10 @@
+{
+  "split": "test",
+  "candidate_source": "commercial_positive_stage2_enabled",
+  "total_candidates": 14,
+  "hard_negative_candidates": 14,
+  "worn_positive_candidates": 0,
+  "hard_negative_rate": 1.0,
+  "unique_samples": 2,
+  "hard_negative_samples": 2
+}

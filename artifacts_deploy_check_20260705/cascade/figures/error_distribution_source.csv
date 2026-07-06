@@ -1,0 +1,5 @@
+sample_name,target,commercial_pred,cascade_pred,bypass_pred,veto_risk,risk_count,window_count,risk_ratio,guard_action,decision_source,guard_mode,fallback,error_type
+s_0023,1,0,0,0,1.0,7,7,1.0,pass,commercial,shadow,False,false_reject
+s_0012,0,1,1,1,1.0,7,7,1.0,extend_detection,commercial,shadow,False,false_wearing
+s_0006,0,1,1,1,1.0,7,7,1.0,extend_detection,commercial,shadow,False,false_wearing
+s_0015,1,0,0,0,1.0,7,7,1.0,pass,commercial,shadow,False,false_reject

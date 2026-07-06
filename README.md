@@ -4,6 +4,177 @@
 
 这个方案适合优先降低“误判佩戴”的商业风险。它不会把商用模型判为未佩戴的样本改成佩戴，只会在商用模型已经判为佩戴的样本中，额外识别是否存在高风险非佩戴样本。
 
+## 0. 先看这一节：如何理解整个项目
+
+这一节用于快速建立全局认识。后面的章节会逐个解释代码文件、参数、产物和使用方法。
+
+### 0.1 一句话理解 cascade
+
+`cascade` 不是替换商用模型，而是在商用模型后面增加一个很小的“风险复核层”。
+
+```text
+商用模型仍然先做决定。
+新增模型只看：商用模型已经判为佩戴的样本里，有没有明显像非佩戴的高风险样本。
+默认 shadow 模式只记录风险，不改变商用最终输出。
+```
+
+### 0.2 端到端运行流程图
+
+```mermaid
+flowchart TD
+    A["H5 数据集<br/>PPG / ACC / target"] --> B["S10 pipeline<br/>统一调度"]
+    B --> C{"是否已有<br/>artifacts/splits.json"}
+    C -- "有，且未指定 --force_split" --> D["复用固定 split"]
+    C -- "没有，或指定 --force_split" --> E["S04 扫描 H5<br/>stratified train/valid/test split"]
+    E --> D
+    D --> F["S05 运行冻结商用模型<br/>输出 commercial_results_*.csv<br/>带进度显示"]
+    F --> G["S06 提取商用阳性候选<br/>聚焦 hard negative"]
+    G --> H["S07 特征排序<br/>生成 ranked_features 和人工模板"]
+    H --> I["S08 训练后置小模型<br/>XGBoost 或 constant guard"]
+    I --> J["S09 评估<br/>commercial_pred vs cascade_pred"]
+    J --> K{"是否加 --explain"}
+    K -- "否" --> L["结束：评估报告和部署包"]
+    K -- "是" --> M["S11 解释性报告<br/>PNG 图、树结构、错误路径"]
+    M --> L
+```
+
+关键点：
+
+- split 在 `S05` 之前完成。`S10` 会先生成或复用 `splits.json`，然后才运行商用模型。
+- 如果已经存在 `splits.json`，默认不会重新划分，所以日志中会显示复用 split。
+- `S05` 时间较长，因为它要逐样本、逐窗口运行冻结商用模型；当前已经增加进度输出。
+
+### 0.3 商用模型冻结边界图
+
+```mermaid
+flowchart LR
+    subgraph Frozen["冻结商用部分：不改特征、不改参数、不改树"]
+        A["s01_model.py"]
+        B["商用 8 特征"]
+        C["OldLivenessModel"]
+        D["TREE_INDEX / TREE_VALUE"]
+        E["detect_tree_threshold"]
+        A --> B
+        A --> C
+        A --> D
+        A --> E
+    end
+
+    subgraph Added["新增部分：只做后置风险复核"]
+        F["error_features_*.csv"]
+        G["selected_features.json"]
+        H["corrector_bundle.pkl"]
+        I["guard_action / veto_risk"]
+    end
+
+    C --> F
+    F --> G
+    G --> H
+    H --> I
+```
+
+验收时优先看：
+
+```text
+artifacts/cascade/commercial_model_manifest.json
+```
+
+其中 `frozen=true`，并且 `tree_index_sha256`、`tree_value_sha256` 不变，说明商用模型参数保持冻结。
+
+### 0.4 hard negative 是怎么形成的
+
+```mermaid
+flowchart TD
+    A["所有样本窗口"] --> B["冻结商用模型输出"]
+    B --> C{"commercial_pred == 1<br/>且 stage2_enabled == true<br/>且 fallback == false"}
+    C -- "否" --> D["不进入 cascade 小模型训练集"]
+    C -- "是" --> E["商用阳性候选"]
+    E --> F{"target == 0"}
+    F -- "是" --> G["hard negative<br/>真实非佩戴，但商用判为佩戴"]
+    F -- "否" --> H["正常商用阳性样本"]
+    G --> I["should_veto = 1"]
+    H --> J["should_veto = 0"]
+```
+
+这也是串联方案的核心：它不是在全量数据上重新训练一个替代模型，而是专门盯住最不能接受的错误类型，也就是“误判佩戴”。
+
+### 0.5 guard 模式决策图
+
+```mermaid
+flowchart TD
+    A["商用输出 commercial_pred"] --> B{"guard_mode"}
+    B -- "bypass" --> C["最终输出 = commercial_pred<br/>完全回退"]
+    B -- "shadow" --> D["最终输出 = commercial_pred<br/>只记录 veto_risk / guard_action"]
+    B -- "soft_guard" --> E{"风险是否持续"}
+    E -- "否" --> F["最终输出 = commercial_pred"]
+    E -- "是" --> G["仍不直接推翻商用<br/>建议延长检测或进入保守后处理"]
+    B -- "hard_veto" --> H{"commercial_pred=1<br/>且风险持续"}
+    H -- "否" --> I["最终输出 = commercial_pred"]
+    H -- "是" --> J["最终输出可改为 0<br/>仅建议离线或严格灰度"]
+```
+
+推荐顺序：
+
+```text
+先 shadow -> 再 soft_guard 灰度 -> 最后才考虑 hard_veto
+```
+
+### 0.6 人工特征选择闭环图
+
+```mermaid
+flowchart TD
+    A["第一次运行 pipeline"] --> B["生成 feature_review/ranked_features.*"]
+    B --> C["人工查看排序、稳定性、业务可解释性"]
+    C --> D["编辑 manual_feature_selection.json"]
+    D --> E["第二次运行 pipeline<br/>--manual_features manual_feature_selection.json"]
+    E --> F["重新训练 corrector_bundle.pkl"]
+    F --> G["重新评估 evaluation_report.json"]
+    G --> H["查看 tree_export / error_trace / figures"]
+    H --> C
+```
+
+这个闭环的目的不是追求训练集指标最高，而是让新增特征满足：
+
+- 能解释。
+- 能部署。
+- 在 train/valid/test 上表现一致。
+- 不依赖标签泄漏字段。
+- 对误判佩戴风险有实际帮助。
+
+### 0.7 产物关系和部署文件图
+
+```mermaid
+flowchart TD
+    A["splits.json<br/>固定数据划分"] --> B["commercial_results_*.csv"]
+    B --> C["error_features_*.csv"]
+    C --> D["feature_review/ranked_features.*"]
+    D --> E["selected_features.json<br/>或 manual_feature_selection.json"]
+    E --> F["corrector_bundle.pkl<br/>部署核心文件"]
+    F --> G["evaluation_report.json<br/>评估摘要"]
+    F --> H["tree_export/<br/>树结构"]
+    F --> I["error_trace/<br/>错误路径"]
+    F --> J["figures/*.png<br/>可视化结果"]
+```
+
+最终部署或交付时，至少保留：
+
+```text
+commercial_model_manifest.json
+splits.json
+selected_features.json
+feature_review/manual_feature_selection.json
+corrector_model.json
+corrector_bundle.pkl
+evaluation_report.json
+evaluation_comparison.csv
+figures/*.png
+tree_export/*
+error_trace/*
+hard_negative_audit/*
+```
+
+注意：`tree_*.png` 依赖系统安装 Graphviz `dot`。如果没有 Graphviz，项目仍会输出 `tree_*.json`、`tree_*.dot` 和 `all_trees.txt`，可解释信息不会丢失。
+
 ## 1. 项目定位
 
 串联方案的推理路径是：
@@ -612,6 +783,307 @@ hard negative 审计报告。重点看：
 - 支持树结构可视化和错误样本路径追踪。
 - 支持 hard negative 审计。
 - 支持人工特征选择。
+
+## 附录 A：数据/特征完整报告与人工特征闭环
+
+本项目已经具备数据分析、特征排序、人工特征确认、重新训练和可解释性复核的闭环能力。这里的“完整报告”不是单个文件，而是一组围绕样本、特征、模型和错误路径的产物。
+
+### A.1 当前会自动生成哪些报告
+
+运行完整 pipeline 并打开 `--explain` 后：
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain
+```
+
+会生成以下几类报告。
+
+#### 1. 数据切分报告
+
+位置：
+
+```text
+artifacts/splits.json
+```
+
+用途：
+
+- 记录 train/valid/test 的样本列表。
+- 固定后续所有实验的数据划分。
+- 后续默认复用，避免每次运行切分变化。
+
+如果要重新切分：
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --force_split
+```
+
+#### 2. 商用模型冻结报告
+
+位置：
+
+```text
+artifacts/cascade/commercial_model_manifest.json
+```
+
+用途：
+
+- 证明商用模型参数没有被新增方案修改。
+- 记录商用特征名、树数量、树节点数、阈值和树数组哈希。
+- 用于上线验收时对比 `tree_index_sha256` 和 `tree_value_sha256`。
+
+#### 3. 商用模型逐窗口输出
+
+位置：
+
+```text
+artifacts/cascade/commercial_results_train.csv
+artifacts/cascade/commercial_results_valid.csv
+artifacts/cascade/commercial_results_test.csv
+```
+
+用途：
+
+- 查看每个窗口商用模型是否进入 Stage2。
+- 查看商用模型的 `pred`、`score`、`fallback`、`is_error`。
+- 分析商用模型在哪些样本上出现误判佩戴。
+
+#### 4. hard negative 审计报告
+
+位置：
+
+```text
+artifacts/cascade/hard_negative_audit/
+```
+
+包含：
+
+```text
+hard_negative_summary_train.json/csv/md
+hard_negative_summary_valid.json/csv/md
+hard_negative_summary_test.json/csv/md
+hard_negative_candidates_train.csv
+hard_negative_candidates_valid.csv
+hard_negative_candidates_test.csv
+```
+
+用途：
+
+- 聚焦真实非佩戴但商用模型判为佩戴的样本。
+- 统计 hard negative 的窗口数、样本数和占比。
+- 帮助判断误判佩戴是否集中在某类数据、某些窗口或某些样本。
+
+#### 5. 特征排序和人工审核报告
+
+位置：
+
+```text
+artifacts/cascade/feature_review/
+```
+
+包含：
+
+```text
+ranked_features.csv
+ranked_features.json
+ranked_features.md
+manual_feature_selection_template.json
+```
+
+用途：
+
+- `ranked_features.csv`：适合用 Excel 或脚本查看完整排序。
+- `ranked_features.json`：适合程序读取。
+- `ranked_features.md`：适合人工阅读。
+- `manual_feature_selection_template.json`：供你手工指定最终训练特征。
+
+排序报告会记录每个候选特征的稳定性、训练/验证 AUC、是否自动入选等信息。训练标签和泄漏字段不会进入候选池。
+
+#### 6. 商用基线 vs 完整方案评估报告
+
+位置：
+
+```text
+artifacts/cascade/evaluation_report.json
+artifacts/cascade/evaluation_samples.csv
+artifacts/cascade/evaluation_comparison.csv
+```
+
+用途：
+
+- 对比只依赖商用模型的 `commercial_pred` 和完整方案的 `cascade_pred`。
+- 查看准确率、precision、recall、F1、混淆矩阵。
+- 在 `shadow` 模式下，`cascade_pred` 不改变商用输出，但仍记录风险。
+
+#### 7. 可解释性图片
+
+位置：
+
+```text
+artifacts/cascade/figures/*.png
+```
+
+当前图片策略：只输出高清 PNG，不输出 PDF、SVG、TIFF。
+
+主要图片包括：
+
+- 商用基线 vs 完整方案指标对比。
+- 样本流转 funnel。
+- 错误类型分布。
+- guard risk 分布。
+
+#### 8. 树结构可视化
+
+位置：
+
+```text
+artifacts/cascade/tree_export/
+```
+
+包含：
+
+```text
+all_trees.txt
+tree_*.json
+tree_*.dot
+tree_*.png
+model_structure_summary.csv
+```
+
+用途：
+
+- 查看最终小 XGBoost 每棵树的完整结构。
+- 检查树深度、分裂特征和阈值是否可解释。
+- 如果训练数据只有单一类别，会输出 constant guard 的结构说明，而不是强行训练一棵无意义的树。
+
+#### 9. 错误样本路径追踪
+
+位置：
+
+```text
+artifacts/cascade/error_trace/
+```
+
+包含：
+
+```text
+error_samples.csv
+error_tree_paths.csv
+error_escape_rules.csv
+error_escape_rules.md
+error_path_node_frequency.png
+```
+
+用途：
+
+- 找出最终仍然错误的样本。
+- 记录这些错误样本经过了哪些树、哪些节点、哪些分支。
+- 总结高频错误路径，辅助判断模型是否学到了不合理规则。
+
+### A.2 推荐的人工特征选择流程
+
+当前 pipeline 不会在特征排序后自动暂停。因此推荐采用“两次运行”的方式。
+
+#### 第一步：先生成排序报告和人工模板
+
+```bash
+cd D:\wearing_liveness\new\new_codex_1\cascade
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain
+```
+
+这一步会自动完成特征排序、自动选择、训练和评估。第一次训练结果可以作为参考，但不是最终结果。
+
+重点查看：
+
+```text
+artifacts/cascade/feature_review/ranked_features.csv
+artifacts/cascade/feature_review/ranked_features.md
+artifacts/cascade/feature_review/manual_feature_selection_template.json
+```
+
+#### 第二步：人工指定最终特征
+
+复制模板：
+
+```text
+manual_feature_selection_template.json
+```
+
+另存为：
+
+```text
+manual_feature_selection.json
+```
+
+编辑其中的：
+
+```json
+{
+  "selected_features": [
+    "commercial_score",
+    "GREEN_SEG_ACDC_CV",
+    "ACC_MAG_MAD"
+  ]
+}
+```
+
+实际特征名必须来自 `ranked_features.csv` 或 `ranked_features.md`。
+
+#### 第三步：使用人工指定特征重新训练和评估
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --manual_features artifacts/cascade/feature_review/manual_feature_selection.json --guard_mode shadow --explain
+```
+
+这次训练会优先使用你指定的 `selected_features`，而不是自动选择结果。
+
+### A.3 人工特征选择的保护机制
+
+训练脚本会拒绝明显的数据泄漏字段。如果手工文件中包含以下字段，会直接报错：
+
+```text
+target
+should_veto
+commercial_pred
+is_error
+fallback
+```
+
+这些字段不能用于模型训练，因为它们直接或间接包含标签、商用预测结果或错误状态。
+
+### A.4 建议人工审核哪些信息
+
+人工选择特征时，建议至少看以下几类信息：
+
+- `ranked_features.md`：排序靠前的特征是否符合业务直觉。
+- `ranked_features.csv`：训练集和验证集表现是否一致。
+- `hard_negative_audit/`：误判佩戴样本是否足够多，是否集中。
+- `evaluation_comparison.csv`：完整方案有没有修复商用错误，同时有没有引入新错误。
+- `tree_export/`：树结构是否过度依赖单一特征或异常阈值。
+- `error_trace/`：错误样本是否集中在某些分支节点。
+
+### A.5 推荐保留的交付材料
+
+一次完整实验建议至少保存：
+
+```text
+commercial_model_manifest.json
+splits.json
+feature_review/ranked_features.csv
+feature_review/ranked_features.md
+feature_review/manual_feature_selection.json
+selected_features.json
+corrector_model.json
+corrector_bundle.pkl
+evaluation_report.json
+evaluation_comparison.csv
+figures/*.png
+tree_export/*
+error_trace/*
+hard_negative_audit/*
+```
+
+这样可以完整复现：数据怎么切、特征怎么排、人工选了哪些特征、模型怎么训、最终效果如何、错误样本为什么错。
 
 ## 13. 注意事项
 
