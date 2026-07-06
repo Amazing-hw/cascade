@@ -1,0 +1,64 @@
+{
+  "project": "cascade",
+  "pipeline_status": "success",
+  "total_elapsed_sec": 22.198,
+  "total_elapsed_human": "22s",
+  "steps": [
+    {
+      "step": "S04-Split data",
+      "status": "success",
+      "elapsed_sec": 0.0,
+      "return_code": 0,
+      "command": "internal ensure_splits",
+      "detail": "reused",
+      "output": "D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_deploy_check_20260705\\splits.json",
+      "order": 1,
+      "elapsed_human": "0s"
+    },
+    {
+      "step": "S05-Run commercial",
+      "status": "success",
+      "elapsed_sec": 4.46,
+      "return_code": 0,
+      "command": "E:\\software\\anaconda\\anaconda\\python.exe D:\\wearing_liveness\\new\\new_codex_1\\cascade\\s05_run_commercial.py --splits_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_deploy_check_20260705 --artifact_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_timing_check --dc_threshold 300000.0",
+      "order": 2,
+      "elapsed_human": "4s"
+    },
+    {
+      "step": "S06-Extract errors",
+      "status": "success",
+      "elapsed_sec": 4.932,
+      "return_code": 0,
+      "command": "E:\\software\\anaconda\\anaconda\\python.exe D:\\wearing_liveness\\new\\new_codex_1\\cascade\\s06_extract_errors.py --splits_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_deploy_check_20260705 --artifact_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_timing_check",
+      "order": 3,
+      "elapsed_human": "5s"
+    },
+    {
+      "step": "S07-Select features",
+      "status": "success",
+      "elapsed_sec": 8.428,
+      "return_code": 0,
+      "command": "E:\\software\\anaconda\\anaconda\\python.exe D:\\wearing_liveness\\new\\new_codex_1\\cascade\\s07_select_features.py --artifact_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_timing_check --max_features 10",
+      "order": 4,
+      "elapsed_human": "8s"
+    },
+    {
+      "step": "S08-Train corrector",
+      "status": "success",
+      "elapsed_sec": 1.606,
+      "return_code": 0,
+      "command": "E:\\software\\anaconda\\anaconda\\python.exe D:\\wearing_liveness\\new\\new_codex_1\\cascade\\s08_train_corrector.py --artifact_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_timing_check --n_estimators 10 --max_depth 2",
+      "order": 5,
+      "elapsed_human": "2s"
+    },
+    {
+      "step": "S09-Evaluate",
+      "status": "success",
+      "elapsed_sec": 2.771,
+      "return_code": 0,
+      "command": "E:\\software\\anaconda\\anaconda\\python.exe D:\\wearing_liveness\\new\\new_codex_1\\cascade\\s09_evaluate.py --artifact_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_timing_check --splits_dir D:\\wearing_liveness\\new\\new_codex_1\\cascade\\artifacts_deploy_check_20260705 --split test --guard_mode shadow --min_veto_windows 2 --min_veto_ratio 0.4",
+      "order": 6,
+      "elapsed_human": "3s"
+    }
+  ]
+}

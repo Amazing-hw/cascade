@@ -5,7 +5,10 @@ S05: Run frozen commercial model on ALL splits, collect errors.
 Output: {artifact_dir}/commercial_results_{train,valid,test}.csv
 """
 
-import argparse, json, os, time
+import argparse
+import json
+import os
+import time
 import numpy as np
 import pandas as pd
 
@@ -50,11 +53,56 @@ def _progress_interval(total):
     return max(1, total // 20)
 
 
+def _safe_rate(count, elapsed):
+    return round(float(count) / float(elapsed), 6) if elapsed > 0 else None
+
+
+def _write_commercial_manifest(artifact_dir):
+    with open(os.path.join(artifact_dir, "commercial_model_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(commercial_model_manifest(), f, indent=2, ensure_ascii=False)
+
+
+def _print_timing_summary(rows):
+    print("\n[S05 TIMING] split summary")
+    for row in rows:
+        print(
+            f"  {row['split']:<5} samples={row['samples']:>5} rows={row['rows']:>6} "
+            f"errors={row['errors']:>6} elapsed={row['elapsed_sec']:>7.1f}s "
+            f"speed={row['samples_per_sec'] or 0:.2f} samples/s"
+        )
+
+
+def _run_split(name, samples, model, dc_threshold, artifact_dir):
+    rows = []
+    split_t0 = time.time()
+    interval = _progress_interval(len(samples))
+    print(f"[{name}] start: {len(samples)} samples", flush=True)
+    for i, sample in enumerate(samples, start=1):
+        rows.extend(run_sample(sample, model, dc_threshold))
+        if i == 1 or i == len(samples) or i % interval == 0:
+            _print_progress(name, i, len(samples), split_t0, len(rows))
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(artifact_dir, f"commercial_results_{name}.csv"), index=False)
+    n_err = df[(df["fallback"] == False)]["is_error"].sum() if len(df) > 0 else 0
+    elapsed = time.time() - split_t0
+    print(f"[{name}] {len(df)} rows, {n_err} errors, elapsed={_format_duration(elapsed)}")
+    return {
+        "split": name,
+        "samples": len(samples),
+        "rows": len(df),
+        "errors": int(n_err),
+        "elapsed_sec": round(elapsed, 3),
+        "samples_per_sec": _safe_rate(len(samples), elapsed),
+        "rows_per_sec": _safe_rate(len(df), elapsed),
+    }
+
+
 def _to_25hz(sample, ppg, acc):
     if _is_25hz_sample(sample):
         return (np.asarray(ppg, dtype=np.float64),
                 np.asarray(acc, dtype=np.float64) if acc is not None and len(acc) > 0 else None, 25)
-    ppg25 = _downsample_ppg(ppg, src_fs=100, tgt_fs=FEATURE_FS); acc25 = None
+    ppg25 = _downsample_ppg(ppg, src_fs=100, tgt_fs=FEATURE_FS)
+    acc25 = None
     if acc is not None and len(acc) > 0:
         from scipy.signal import resample_poly
         acc25 = resample_poly(np.asarray(acc, dtype=np.float32), FEATURE_FS, 100, axis=0).astype(np.float64)
@@ -70,17 +118,20 @@ def _prewindow_to_25hz(sample, window, window_sec):
 
 
 def _slice_acc(acc25, start, size):
-    if acc25 is None or start >= len(acc25): return None
+    if acc25 is None or start >= len(acc25):
+        return None
     return acc25[start:start + size]
 
 
 def _stage1_pass(window, dc_threshold, ppg_src_fs):
     ir5 = downsample_to_5hz(window[:, 0], ppg_src_fs, STAGE1_FS)
     s1_win = int(round(STAGE1_PRIMITIVE_SEC * STAGE1_FS))
-    if len(ir5) < s1_win: return False
+    if len(ir5) < s1_win:
+        return False
     gate = CommercialStage1Gate(dc_threshold, K=STAGE1_GATE_K)
     enabled = False
-    for s in range(0, len(ir5) - s1_win + 1, s1_win): enabled = bool(gate.update(ir5[s:s + s1_win]))
+    for start in range(0, len(ir5) - s1_win + 1, s1_win):
+        enabled = bool(gate.update(ir5[start:start + s1_win]))
     return enabled
 
 
@@ -114,12 +165,15 @@ def run_sample(sample, model, dc_threshold):
                             "pred": int(is_live), "is_error": int(int(is_live) != base["target"]),
                             "fallback": False, "fallback_reason": None})
         return results
-    ppg25, acc25, ppg_src = _to_25hz(sample, ppg, acc); mode = detect_green_mode(ppg)
+    ppg25, acc25, ppg_src = _to_25hz(sample, ppg, acc)
+    mode = detect_green_mode(ppg)
     ir5 = downsample_to_5hz(ppg[:, 0], ppg_src, STAGE1_FS)
     s1_win = int(round(STAGE1_PRIMITIVE_SEC * STAGE1_FS))
-    s2_win = int(round(COMMERCIAL_WIN_SEC * FEATURE_FS)); s2_stride = max(1, int(round(COMMERCIAL_STRIDE_SEC * FEATURE_FS)))
+    s2_win = int(round(COMMERCIAL_WIN_SEC * FEATURE_FS))
+    s2_stride = max(1, int(round(COMMERCIAL_STRIDE_SEC * FEATURE_FS)))
     n_s1, n_s2 = max(0, (len(ir5) - s1_win) // s1_win + 1), max(0, (len(ppg25) - s2_win) // s2_stride + 1)
-    gate = CommercialStage1Gate(dc_threshold, K=STAGE1_GATE_K); last_s1 = -1
+    gate = CommercialStage1Gate(dc_threshold, K=STAGE1_GATE_K)
+    last_s1 = -1
     for step in range(SKIP_INITIAL, n_s2):
         tgt = int(np.floor(step * s2_stride / FEATURE_FS + 1e-9))
         if tgt >= n_s1: break
@@ -141,25 +195,32 @@ def run_sample(sample, model, dc_threshold):
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--artifact_dir", default="artifacts/cascade")
-    p.add_argument("--splits_dir", default="artifacts"); p.add_argument("--dc_threshold", type=float, default=0.3e6)
-    args = p.parse_args(); os.makedirs(args.artifact_dir, exist_ok=True)
-    with open(os.path.join(args.artifact_dir, "commercial_model_manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(commercial_model_manifest(), f, indent=2, ensure_ascii=False)
-    splits = load_splits(args.splits_dir); model = OldLivenessModel(); t0 = time.time()
-    for name in ["train", "valid", "test"]:
-        samples = splits[name]
-        rows = []
-        split_t0 = time.time()
-        interval = _progress_interval(len(samples))
-        print(f"[{name}] start: {len(samples)} samples", flush=True)
-        for i, s in enumerate(samples, start=1):
-            rows.extend(run_sample(s, model, args.dc_threshold))
-            if i == 1 or i == len(samples) or i % interval == 0:
-                _print_progress(name, i, len(samples), split_t0, len(rows))
-        df = pd.DataFrame(rows); df.to_csv(os.path.join(args.artifact_dir, f"commercial_results_{name}.csv"), index=False)
-        n_err = df[(df["fallback"] == False)]["is_error"].sum() if len(df) > 0 else 0
-        print(f"[{name}] {len(df)} rows, {n_err} errors")
-    print(f"Done ({time.time()-t0:.1f}s)")
+    p = argparse.ArgumentParser()
+    p.add_argument("--artifact_dir", default="artifacts/cascade")
+    p.add_argument("--splits_dir", default="artifacts")
+    p.add_argument("--dc_threshold", type=float, default=0.3e6)
+    args = p.parse_args()
 
-if __name__ == "__main__": main()
+    os.makedirs(args.artifact_dir, exist_ok=True)
+    _write_commercial_manifest(args.artifact_dir)
+    splits = load_splits(args.splits_dir)
+    model = OldLivenessModel()
+    t0 = time.time()
+    timing_rows = []
+    for name in ["train", "valid", "test"]:
+        timing_rows.append(_run_split(name, splits[name], model, args.dc_threshold, args.artifact_dir))
+    total_elapsed = time.time() - t0
+    timing_rows.append({
+        "split": "total",
+        "samples": int(sum(r["samples"] for r in timing_rows)),
+        "rows": int(sum(r["rows"] for r in timing_rows)),
+        "errors": int(sum(r["errors"] for r in timing_rows)),
+        "elapsed_sec": round(total_elapsed, 3),
+        "samples_per_sec": _safe_rate(sum(r["samples"] for r in timing_rows), total_elapsed),
+        "rows_per_sec": _safe_rate(sum(r["rows"] for r in timing_rows), total_elapsed),
+    })
+    _print_timing_summary(timing_rows)
+    print(f"Done ({total_elapsed:.1f}s / {_format_duration(total_elapsed)})")
+
+if __name__ == "__main__":
+    main()

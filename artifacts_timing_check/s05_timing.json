@@ -1,0 +1,41 @@
+{
+  "stage": "S05-Run commercial",
+  "splits": [
+    {
+      "split": "train",
+      "samples": 16,
+      "rows": 112,
+      "errors": 112,
+      "elapsed_sec": 1.915,
+      "samples_per_sec": 8.356271,
+      "rows_per_sec": 58.493899
+    },
+    {
+      "split": "valid",
+      "samples": 4,
+      "rows": 28,
+      "errors": 28,
+      "elapsed_sec": 0.446,
+      "samples_per_sec": 8.974077,
+      "rows_per_sec": 62.818537
+    },
+    {
+      "split": "test",
+      "samples": 4,
+      "rows": 28,
+      "errors": 28,
+      "elapsed_sec": 0.433,
+      "samples_per_sec": 9.240061,
+      "rows_per_sec": 64.680428
+    },
+    {
+      "split": "total",
+      "samples": 24,
+      "rows": 168,
+      "errors": 168,
+      "elapsed_sec": 2.793,
+      "samples_per_sec": 8.591593,
+      "rows_per_sec": 60.141151
+    }
+  ]
+}

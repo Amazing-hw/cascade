@@ -1,0 +1,2 @@
+split,candidate_source,total_candidates,hard_negative_candidates,worn_positive_candidates,hard_negative_rate,unique_samples,hard_negative_samples
+train,commercial_positive_stage2_enabled,56,56,0,1.0,8,8

@@ -5,7 +5,11 @@ S07: Stability feature selection on commercial error data.
 Output: {artifact_dir}/selected_features.json
 """
 
-import argparse, json, os, sys, time
+import argparse
+import json
+import os
+import sys
+import time
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -55,6 +59,7 @@ def write_feature_review(artifact_dir, train_df, valid_df, ranked, selected_feat
     out_dir = os.path.join(artifact_dir, "feature_review")
     os.makedirs(out_dir, exist_ok=True)
     rows = []
+    selected_set = set(selected_features)
     for i, item in enumerate(ranked, start=1):
         feature = item["feature"]
         train_values = train_df[feature] if feature in train_df else pd.Series(dtype=float)
@@ -74,8 +79,8 @@ def write_feature_review(artifact_dir, train_df, valid_df, ranked, selected_feat
             "freq": float(item.get("freq", 0.0)),
             "avg_importance": float(item.get("avg_importance", 0.0)),
             "combined_score": float(item.get("combined_score", 0.0)),
-            "selected_auto": feature in set(selected_features),
-            "recommendation": "keep" if feature in set(selected_features) else "review",
+            "selected_auto": feature in selected_set,
+            "recommendation": "keep" if feature in selected_set else "review",
         })
     ranked_df = pd.DataFrame(rows)
     ranked_df.to_csv(os.path.join(out_dir, "ranked_features.csv"), index=False)
@@ -97,32 +102,43 @@ def write_feature_review(artifact_dir, train_df, valid_df, ranked, selected_feat
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--artifact_dir", default="artifacts/cascade")
-    p.add_argument("--max_features", type=int, default=10); args = p.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--artifact_dir", default="artifacts/cascade")
+    p.add_argument("--max_features", type=int, default=10)
+    args = p.parse_args()
     os.makedirs(args.artifact_dir, exist_ok=True)
     tp = os.path.join(args.artifact_dir, "error_features_train.csv")
-    if not os.path.exists(tp): print(f"ERROR: {tp} not found"); sys.exit(1)
-    t0 = time.time(); dt = pd.read_csv(tp)
+    if not os.path.exists(tp):
+        print(f"ERROR: {tp} not found")
+        sys.exit(1)
+    t0 = time.time()
+    dt = pd.read_csv(tp)
     vp = os.path.join(args.artifact_dir, "error_features_valid.csv")
     dv = pd.read_csv(vp) if os.path.exists(vp) else dt.copy()
     fcols = get_candidate_feature_cols(dt)
     dtc, dvc, kept, _, _ = clean_features_by_train(dt, dv, fcols, missing_thresh=0.5, corr_thresh=0.95, skip_vif=True)
-    presel = fast_group_preselection(dtc, kept, preselect_top=6); presel_cols = sorted(presel.keys())
+    presel = fast_group_preselection(dtc, kept, preselect_top=6)
+    presel_cols = sorted(presel.keys())
     stab = stability_selection(dtc, presel_cols, max_splits=min(5, dtc["sample_name"].nunique()),
                                seeds=[1, 7, 42], min_fold_auc=0.55)
     if not stab:
         stab = [{"feature": f, "freq": 1.0, "avg_importance": 0.01, "avg_rank": i, "group": feature_to_group(f)}
                 for i, f in enumerate(presel_cols)]
-    for r in stab: r["combined_score"] = r.get("freq", 0.5) * r.get("avg_importance", 0.01)
+    for row in stab:
+        row["combined_score"] = row.get("freq", 0.5) * row.get("avg_importance", 0.01)
     stab.sort(key=lambda r: r["combined_score"], reverse=True)
     stab = add_deployment_scores(stab, deployment_score_weight=0.15)
     sel = select_by_group_from_combined(stab, max_features=args.max_features, min_acc_features=1)
     feats = sel[0] if isinstance(sel, tuple) else sel
-    final = ["commercial_score"] + [f for f in feats if f != "commercial_score"]; final = final[:args.max_features + 1]
+    final = ["commercial_score"] + [f for f in feats if f != "commercial_score"]
+    final = final[:args.max_features + 1]
     write_feature_review(args.artifact_dir, dtc, dvc, stab, final, args.max_features)
-    print(f"Selected ({len(final)}):"); [print(f"  {i+1}. {f}") for i, f in enumerate(final)]
+    print(f"Selected ({len(final)}):")
+    for i, feature in enumerate(final, start=1):
+        print(f"  {i}. {feature}")
     with open(os.path.join(args.artifact_dir, "selected_features.json"), "w") as f:
         json.dump({"selected_features": final, "n_features": len(final), "commercial_score_included": True}, f, indent=2)
     print(f"Done ({time.time()-t0:.1f}s)")
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

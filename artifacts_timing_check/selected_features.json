@@ -1,0 +1,7 @@
+{
+  "selected_features": [
+    "commercial_score"
+  ],
+  "n_features": 1,
+  "commercial_score_included": true
+}
