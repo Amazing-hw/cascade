@@ -1,5 +1,0 @@
-split,samples,rows,errors,elapsed_sec,samples_per_sec,rows_per_sec
-train,16,112,112,1.915,8.356271,58.493899
-valid,4,28,28,0.446,8.974077,62.818537
-test,4,28,28,0.433,9.240061,64.680428
-total,24,168,168,2.793,8.591593,60.141151

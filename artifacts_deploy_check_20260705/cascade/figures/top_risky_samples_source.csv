@@ -1,5 +1,0 @@
-sample_name,target,commercial_pred,cascade_pred,veto_risk,risk_ratio,guard_action,error_type
-s_0023,1,0,0,1.0,1.0,pass,false_reject
-s_0012,0,1,1,1.0,1.0,extend_detection,false_wearing
-s_0006,0,1,1,1.0,1.0,extend_detection,false_wearing
-s_0015,1,0,0,1.0,1.0,pass,false_reject
