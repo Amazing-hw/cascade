@@ -615,6 +615,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--artifact_dir", default="artifacts/cascade")
     p.add_argument("--split", default="test")
+    p.add_argument("--plot_mode", default="full", choices=["basic", "full"])
     args = p.parse_args()
     eval_path = os.path.join(args.artifact_dir, "evaluation_samples.csv")
     bundle_path = os.path.join(args.artifact_dir, BUNDLE_NAME)
@@ -636,10 +637,13 @@ def main():
     write_top_risky_samples_figure(eval_df, args.artifact_dir, pred_col=PRED_COL)
     write_feature_ranking_figure(args.artifact_dir)
     write_hard_negative_summary_figure(args.artifact_dir)
-    export_trees(model, os.path.join(args.artifact_dir, "tree_export"))
-    error_rows = export_error_paths(model, features, eval_df, feature_df, PRED_COL, os.path.join(args.artifact_dir, "error_trace"))
-    write_error_escape_rules(error_rows, os.path.join(args.artifact_dir, "error_trace"))
-    write_commercial_filter_report(args.artifact_dir, args.split)
+    if args.plot_mode == "full":
+        export_trees(model, os.path.join(args.artifact_dir, "tree_export"))
+        error_rows = export_error_paths(model, features, eval_df, feature_df, PRED_COL, os.path.join(args.artifact_dir, "error_trace"))
+        write_error_escape_rules(error_rows, os.path.join(args.artifact_dir, "error_trace"))
+        write_commercial_filter_report(args.artifact_dir, args.split)
+    else:
+        print("Basic plot mode: skipped tree export, error-path tracing, and commercial filter detail report.")
     print("Explainability reports written")
 
 

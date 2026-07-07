@@ -126,6 +126,12 @@ def main():
     p.add_argument("--force_split", action="store_true")
     p.add_argument("--dc_threshold", type=float, default=0.3e6)
     p.add_argument("--max_features", type=int, default=10)
+    p.add_argument("--preselect_top", type=int, default=4)
+    p.add_argument("--stability_splits", type=int, default=4)
+    p.add_argument("--stability_seeds", default="1,7")
+    p.add_argument("--stability_max_rows", type=int, default=5000)
+    p.add_argument("--permutation_repeats", type=int, default=3)
+    p.add_argument("--rank_only", action="store_true")
     p.add_argument("--n_estimators", type=int, default=10)
     p.add_argument("--max_depth", type=int, default=2)
     p.add_argument("--eval_split", default="test")
@@ -134,6 +140,7 @@ def main():
     p.add_argument("--min_veto_ratio", type=float, default=0.4)
     p.add_argument("--manual_features", default=None)
     p.add_argument("--explain", action="store_true")
+    p.add_argument("--plot_mode", default="full", choices=["basic", "full"])
     p.add_argument("--dry_run", action="store_true")
     args = p.parse_args()
 
@@ -163,13 +170,25 @@ def main():
     ]
     if args.n_workers is not None:
         s05_args += ["--n_workers", str(args.n_workers)]
-    s07_args = ["--artifact_dir", paths["artifact_dir"], "--max_features", str(args.max_features)]
+    s07_args = [
+        "--artifact_dir", paths["artifact_dir"],
+        "--max_features", str(args.max_features),
+        "--preselect_top", str(args.preselect_top),
+        "--stability_splits", str(args.stability_splits),
+        "--stability_seeds", args.stability_seeds,
+        "--stability_max_rows", str(args.stability_max_rows),
+        "--permutation_repeats", str(args.permutation_repeats),
+    ]
+    if args.rank_only:
+        s07_args.append("--rank_only")
     if args.n_workers is not None:
         s07_args += ["--n_workers", str(args.n_workers)]
+    s06_args = ["--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"]]
+    if args.n_workers is not None:
+        s06_args += ["--n_workers", str(args.n_workers)]
     steps = [
         ("S05-Run commercial", os.path.join(d, "s05_run_commercial.py"), s05_args),
-        ("S06-Extract errors", os.path.join(d, "s06_extract_errors.py"),
-         ["--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"]]),
+        ("S06-Extract errors", os.path.join(d, "s06_extract_errors.py"), s06_args),
         ("S07-Select features", os.path.join(d, "s07_select_features.py"), s07_args),
         ("S08-Train corrector", os.path.join(d, "s08_train_corrector.py"), train_args),
         ("S09-Evaluate", os.path.join(d, "s09_evaluate.py"),
@@ -178,7 +197,10 @@ def main():
           "--min_veto_ratio", str(args.min_veto_ratio)]),
     ]
     if args.explain:
-        steps.append(("S11-Explain", os.path.join(d, "s11_explain.py"), ["--artifact_dir", paths["artifact_dir"], "--split", args.eval_split]))
+        steps.append(("S11-Explain", os.path.join(d, "s11_explain.py"), [
+            "--artifact_dir", paths["artifact_dir"], "--split", args.eval_split,
+            "--plot_mode", args.plot_mode,
+        ]))
 
     for desc, script, step_args in steps:
         if args.dry_run:

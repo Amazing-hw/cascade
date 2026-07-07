@@ -6,6 +6,7 @@ Output: {artifact_dir}/error_features_{train,valid,test}.csv
 """
 
 import argparse, os, time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import numpy as np
 import pandas as pd
@@ -13,9 +14,10 @@ import pandas as pd
 from s02_features import load_ppg, load_acc, get_channels_from_window, detect_green_mode
 from s02_features import is_prewindowed_signal, _downsample_ppg, _is_25hz_sample
 from s02_features import extract_feature_pool_from_window, validate_h5_file
-from s04_data import load_splits
+from s04_data import load_splits, multiprocessing_context_from_env, resolve_n_workers
 
 FEATURE_FS = 25
+MIN_AUTO_PARALLEL_GROUPS = 32
 
 
 def _format_duration(seconds):
@@ -45,6 +47,14 @@ def _print_progress(split_name, done, total, start_time, ok, skip):
         f"speed={rate:.2f}/s eta={_format_duration(eta)} ok={ok} skipped={skip}",
         flush=True,
     )
+
+
+def _resolve_s06_workers(n_workers, total):
+    if n_workers is None:
+        if total < MIN_AUTO_PARALLEL_GROUPS:
+            return 1
+        return resolve_n_workers(None, n_items=total)
+    return resolve_n_workers(n_workers, n_items=total)
 
 
 def build_hard_negative_summary(df, split):
@@ -127,9 +137,79 @@ def _to_25hz(sample, ppg, acc):
     return ppg25, acc25, 100
 
 
+def _process_candidate_group(split, sn, records, sample):
+    rows, skip_rows, ok, skip = [], [], 0, 0
+    if sample is None:
+        for row in records:
+            skip += 1
+            skip_rows.append({"split": split, "sample_name": sn, "window_idx": int(row["window_idx"]),
+                              "reason": "sample_not_found", "detail": ""})
+        return {"rows": rows, "skip_rows": skip_rows, "ok": ok, "skip": skip, "processed": len(records)}
+    try:
+        ppg, acc = load_ppg(sample), load_acc(sample)
+    except Exception as exc:
+        for row in records:
+            skip += 1
+            skip_rows.append({"split": split, "sample_name": sn, "window_idx": int(row["window_idx"]),
+                              "reason": "load_signal_failed", "detail": str(exc)})
+        return {"rows": rows, "skip_rows": skip_rows, "ok": ok, "skip": skip, "processed": len(records)}
+    try:
+        mode = detect_green_mode(ppg)
+        prewindowed = is_prewindowed_signal(ppg)
+        if not prewindowed:
+            ppg25, _acc25, _ = _to_25hz(sample, ppg, acc)
+            sw, ss = int(round(5.0 * FEATURE_FS)), int(round(1.0 * FEATURE_FS))
+    except Exception as exc:
+        for row in records:
+            skip += 1
+            skip_rows.append({"split": split, "sample_name": sn, "window_idx": int(row["window_idx"]),
+                              "reason": "sample_preprocess_failed", "detail": str(exc)})
+        return {"rows": rows, "skip_rows": skip_rows, "ok": ok, "skip": skip, "processed": len(records)}
+
+    for row in records:
+        widx = int(row["window_idx"])
+        try:
+            score = float(row["score"]) if pd.notna(row["score"]) else -2000.0
+            if prewindowed:
+                if widx >= ppg.shape[0]:
+                    skip += 1
+                    skip_rows.append({"split": split, "sample_name": sn, "window_idx": widx,
+                                      "reason": "window_index_out_of_bounds", "detail": f"n_windows={ppg.shape[0]}"})
+                    continue
+                win25, _ = _prewindow_to_25hz(sample, ppg[widx], 5.0)
+                ir, amb, g1, g2, g3 = get_channels_from_window(win25, mode)
+            else:
+                if widx * ss + sw > len(ppg25):
+                    skip += 1
+                    skip_rows.append({"split": split, "sample_name": sn, "window_idx": widx,
+                                      "reason": "window_slice_out_of_range", "detail": f"signal_len={len(ppg25)}"})
+                    continue
+                win = ppg25[widx * ss:widx * ss + sw, :]
+                ir, amb, g1, g2, g3 = get_channels_from_window(win, mode)
+            feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
+            target = int(row["target"])
+            out = {"sample_name": sn, "target": target, "should_veto": int(target == 0),
+                   "commercial_pred": int(row["pred"]), "window_idx": widx,
+                   "commercial_score": score, "is_error": int(row["is_error"])}
+            out.update(feats)
+            rows.append(out)
+            ok += 1
+        except Exception as exc:
+            skip += 1
+            skip_rows.append({"split": split, "sample_name": sn, "window_idx": widx,
+                              "reason": "feature_extraction_failed", "detail": str(exc)})
+    return {"rows": rows, "skip_rows": skip_rows, "ok": ok, "skip": skip, "processed": len(records)}
+
+
+def _s06_group_worker(args):
+    return _process_candidate_group(*args)
+
+
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--artifact_dir", default="artifacts/cascade")
-    p.add_argument("--splits_dir", default="artifacts"); args = p.parse_args()
+    p.add_argument("--splits_dir", default="artifacts")
+    p.add_argument("--n_workers", type=int, default=None)
+    args = p.parse_args()
     os.makedirs(args.artifact_dir, exist_ok=True)
     splits = load_splits(args.splits_dir)
     sn_map = {}; [sn_map.update({s["sample_name"]: s}) for part in ["train","valid","test"] for s in splits[part]]
@@ -149,78 +229,41 @@ def main():
         interval = _progress_interval(total_candidates)
         split_t0 = time.time()
         processed = 0
-        print(f"[{name}] candidates={total_candidates}, samples={errors['sample_name'].nunique()}", flush=True)
-        for sn, group in errors.groupby("sample_name", sort=False):
-            sample = sn_map.get(sn)
-            if sample is None:
-                for _, row in group.iterrows():
-                    processed += 1
-                    skip += 1
-                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": int(row["window_idx"]),
-                                      "reason": "sample_not_found", "detail": ""})
-                    if processed == 1 or processed == total_candidates or processed % interval == 0:
+        groups = [
+            (sn, group.to_dict("records"), sn_map.get(sn))
+            for sn, group in errors.groupby("sample_name", sort=False)
+        ]
+        n_workers = _resolve_s06_workers(args.n_workers, len(groups))
+        print(f"[{name}] candidates={total_candidates}, samples={len(groups)}, workers={n_workers}", flush=True)
+        if n_workers > 1 and len(groups) > 1:
+            pool_kwargs = {"max_workers": n_workers}
+            mp_ctx = multiprocessing_context_from_env()
+            if mp_ctx is not None:
+                pool_kwargs["mp_context"] = mp_ctx
+            with ProcessPoolExecutor(**pool_kwargs) as executor:
+                futures = [
+                    executor.submit(_s06_group_worker, (name, sn, records, sample))
+                    for sn, records, sample in groups
+                ]
+                for future in as_completed(futures):
+                    result = future.result()
+                    rows.extend(result["rows"])
+                    skip_rows.extend(result["skip_rows"])
+                    ok += int(result["ok"])
+                    skip += int(result["skip"])
+                    processed += int(result["processed"])
+                    if processed == total_candidates or processed % interval == 0 or processed - int(result["processed"]) == 0:
                         _print_progress(name, processed, total_candidates, split_t0, ok, skip)
-                continue
-            try: ppg, acc = load_ppg(sample), load_acc(sample)
-            except Exception as exc:
-                for _, row in group.iterrows():
-                    processed += 1
-                    skip += 1
-                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": int(row["window_idx"]),
-                                      "reason": "load_signal_failed", "detail": str(exc)})
-                    if processed == 1 or processed == total_candidates or processed % interval == 0:
-                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
-                continue
-            try:
-                mode = detect_green_mode(ppg)
-                prewindowed = is_prewindowed_signal(ppg)
-                if not prewindowed:
-                    ppg25, acc25, _ = _to_25hz(sample, ppg, acc)
-                    sw, ss = int(round(5.0 * FEATURE_FS)), int(round(1.0 * FEATURE_FS))
-            except Exception as exc:
-                for _, row in group.iterrows():
-                    processed += 1
-                    skip += 1
-                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": int(row["window_idx"]),
-                                      "reason": "sample_preprocess_failed", "detail": str(exc)})
-                    if processed == 1 or processed == total_candidates or processed % interval == 0:
-                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
-                continue
-            for _, row in group.iterrows():
-                processed += 1
-                widx = int(row["window_idx"])
-                try:
-                    score = float(row["score"]) if pd.notna(row["score"]) else -2000.0
-                    if prewindowed:
-                        if widx >= ppg.shape[0]:
-                            skip += 1
-                            skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                              "reason": "window_index_out_of_bounds", "detail": f"n_windows={ppg.shape[0]}"})
-                            continue
-                        win25, _ = _prewindow_to_25hz(sample, ppg[widx], 5.0)
-                        ir, amb, g1, g2, g3 = get_channels_from_window(win25, mode)
-                        feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
-                    else:
-                        if widx * ss + sw > len(ppg25):
-                            skip += 1
-                            skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                              "reason": "window_slice_out_of_range", "detail": f"signal_len={len(ppg25)}"})
-                            continue
-                        win = ppg25[widx * ss:widx * ss + sw, :]
-                        ir, amb, g1, g2, g3 = get_channels_from_window(win, mode)
-                        feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
-                    target = int(row["target"])
-                    r = {"sample_name": sn, "target": target, "should_veto": int(target == 0),
-                         "commercial_pred": int(row["pred"]), "window_idx": widx,
-                         "commercial_score": score, "is_error": int(row["is_error"])}
-                    r.update(feats); rows.append(r); ok += 1
-                except Exception as exc:
-                    skip += 1
-                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                      "reason": "feature_extraction_failed", "detail": str(exc)})
-                finally:
-                    if processed == 1 or processed == total_candidates or processed % interval == 0:
-                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
+        else:
+            for sn, records, sample in groups:
+                result = _process_candidate_group(name, sn, records, sample)
+                rows.extend(result["rows"])
+                skip_rows.extend(result["skip_rows"])
+                ok += int(result["ok"])
+                skip += int(result["skip"])
+                processed += int(result["processed"])
+                if processed == total_candidates or processed % interval == 0 or processed - int(result["processed"]) == 0:
+                    _print_progress(name, processed, total_candidates, split_t0, ok, skip)
         print(f"[{name}] Extracted={ok} skipped={skip}")
         df = pd.DataFrame(rows)
         if rows:
