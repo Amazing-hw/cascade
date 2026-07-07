@@ -72,6 +72,22 @@ def metric(yt, yp):
             "confusion": {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)}}
 
 
+def confusion_matrix_rows(model_name, metrics):
+    c = metrics["confusion"]
+    return [
+        {"model": model_name, "true_label": 0, "pred_0": int(c["TN"]), "pred_1": int(c["FP"])},
+        {"model": model_name, "true_label": 1, "pred_0": int(c["FN"]), "pred_1": int(c["TP"])},
+    ]
+
+
+def print_confusion_matrix(title, metrics):
+    c = metrics["confusion"]
+    print(f"{title} confusion matrix (rows=true label, cols=pred label)")
+    print("              pred_0  pred_1")
+    print(f"  true_0      {int(c['TN']):6d}  {int(c['FP']):6d}")
+    print(f"  true_1      {int(c['FN']):6d}  {int(c['TP']):6d}")
+
+
 GUARD_MODES = ("bypass", "shadow", "soft_guard", "hard_veto")
 
 
@@ -208,7 +224,9 @@ def write_evaluation_outputs(artifact_dir, split, guard_mode, min_veto_windows, 
     fixed = sum(1 for d in disc if d["cascade_pred"] == d["target"] and d["commercial_pred"] != d["target"])
     broken = sum(1 for d in disc if d["commercial_pred"] == d["target"] and d["cascade_pred"] != d["target"])
     print(f"Commercial: acc={cm['accuracy']:.4f} prec={cm['precision']:.4f} rec={cm['recall']:.4f} f1={cm['f1']:.4f}")
+    print_confusion_matrix("Commercial baseline", cm)
     print(f"Cascade:    acc={casm['accuracy']:.4f} prec={casm['precision']:.4f} rec={casm['recall']:.4f} f1={casm['f1']:.4f}")
+    print_confusion_matrix("Cascade final", casm)
     print(f"Disagreements: {len(disc)}/{len(results)} (fixed={fixed}, broken={broken})")
     report = {"split": split, "n": len(results), "guard_mode": guard_mode,
               "min_veto_windows": min_veto_windows, "min_veto_ratio": min_veto_ratio,
@@ -220,6 +238,9 @@ def write_evaluation_outputs(artifact_dir, split, guard_mode, min_veto_windows, 
     pd.DataFrame([{"metric": m, "commercial": cm[m], "cascade": casm[m], "delta": casm[m] - cm[m]}
                   for m in ["accuracy", "precision", "recall", "f1"]])\
       .to_csv(os.path.join(artifact_dir, "evaluation_comparison.csv"), index=False)
+    pd.DataFrame(
+        confusion_matrix_rows("commercial", cm) + confusion_matrix_rows("cascade", casm)
+    ).to_csv(os.path.join(artifact_dir, "evaluation_confusion_matrices.csv"), index=False)
 
 
 def main():
@@ -304,23 +325,10 @@ def main():
                         "decision_source": decision["decision_source"],
                         "guard_mode": args.guard_mode, "fallback": False})
     print(f"Inference ({time.time()-t0:.1f}s)")
-    cm = metric([r["target"] for r in results], [r["commercial_pred"] for r in results])
-    casm = metric([r["target"] for r in results], [r["cascade_pred"] for r in results])
-    disc = [r for r in results if r["commercial_pred"] != r["cascade_pred"]]
-    fixed = sum(1 for d in disc if d["cascade_pred"] == d["target"] and d["commercial_pred"] != d["target"])
-    broken = sum(1 for d in disc if d["commercial_pred"] == d["target"] and d["cascade_pred"] != d["target"])
-    print(f"Commercial: acc={cm['accuracy']:.4f} prec={cm['precision']:.4f} rec={cm['recall']:.4f} f1={cm['f1']:.4f}")
-    print(f"Cascade:    acc={casm['accuracy']:.4f} prec={casm['precision']:.4f} rec={casm['recall']:.4f} f1={casm['f1']:.4f}")
-    print(f"Disagreements: {len(disc)}/{len(results)} (fixed={fixed}, broken={broken})")
-    report = {"split": args.split, "n": len(results), "guard_mode": args.guard_mode,
-              "min_veto_windows": args.min_veto_windows, "min_veto_ratio": args.min_veto_ratio,
-              "commercial": cm, "cascade": casm, "bypass": cm,
-              "n_disagreements": len(disc), "fixed": fixed, "broken": broken}
-    with open(os.path.join(args.artifact_dir, "evaluation_report.json"), "w") as f: json.dump(report, f, indent=2)
-    pd.DataFrame(results).to_csv(os.path.join(args.artifact_dir, "evaluation_samples.csv"), index=False)
-    pd.DataFrame([{"metric": m, "commercial": cm[m], "cascade": casm[m], "delta": casm[m] - cm[m]}
-                  for m in ["accuracy", "precision", "recall", "f1"]])\
-      .to_csv(os.path.join(args.artifact_dir, "evaluation_comparison.csv"), index=False)
+    write_evaluation_outputs(
+        args.artifact_dir, args.split, args.guard_mode,
+        args.min_veto_windows, args.min_veto_ratio, results
+    )
     print("Done")
 
 if __name__ == "__main__": main()

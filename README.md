@@ -624,6 +624,7 @@ artifacts/cascade/corrector_bundle.pkl
 artifacts/cascade/evaluation_report.json
 artifacts/cascade/evaluation_samples.csv
 artifacts/cascade/evaluation_comparison.csv
+artifacts/cascade/evaluation_confusion_matrices.csv
 ```
 
 核心对比：
@@ -907,6 +908,20 @@ hard negative 审计报告。重点看：
 - veto risk。
 - guard action。
 - 是否 fallback。
+
+### `evaluation_confusion_matrices.csv`
+
+0/1 样本混淆矩阵，行是真实标签，列是预测标签：
+
+```text
+model,true_label,pred_0,pred_1
+commercial,0,TN,FP
+commercial,1,FN,TP
+cascade,0,TN,FP
+cascade,1,FN,TP
+```
+
+`S09` 运行时也会在终端打印商用基线和串联完整方案的矩阵。串联方案分析时重点看商用基线的 `true_label=0, pred_1`，也就是非佩戴被误判为佩戴的数量。
 
 ### `tree_export/`
 
