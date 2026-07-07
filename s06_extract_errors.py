@@ -18,6 +18,35 @@ from s04_data import load_splits
 FEATURE_FS = 25
 
 
+def _format_duration(seconds):
+    seconds = max(0, int(round(float(seconds))))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m:d}m{s:02d}s"
+    return f"{s:d}s"
+
+
+def _progress_interval(total):
+    if total <= 20:
+        return 1
+    return max(1, total // 20)
+
+
+def _print_progress(split_name, done, total, start_time, ok, skip):
+    elapsed = max(1e-9, time.time() - start_time)
+    rate = done / elapsed
+    eta = (total - done) / rate if rate > 0 else 0.0
+    pct = 100.0 * done / total if total else 100.0
+    print(
+        f"[{split_name}] candidates {done}/{total} ({pct:5.1f}%) "
+        f"speed={rate:.2f}/s eta={_format_duration(eta)} ok={ok} skipped={skip}",
+        flush=True,
+    )
+
+
 def build_hard_negative_summary(df, split):
     if df is None or len(df) == 0:
         return {
@@ -116,52 +145,82 @@ def main():
             write_hard_negative_audit(args.artifact_dir, name, pd.DataFrame())
             continue
         rows, skip_rows, ok, skip = [], [], 0, 0
-        for _, row in errors.iterrows():
-            sn, widx = row["sample_name"], int(row["window_idx"])
+        total_candidates = len(errors)
+        interval = _progress_interval(total_candidates)
+        split_t0 = time.time()
+        processed = 0
+        print(f"[{name}] candidates={total_candidates}, samples={errors['sample_name'].nunique()}", flush=True)
+        for sn, group in errors.groupby("sample_name", sort=False):
             sample = sn_map.get(sn)
             if sample is None:
-                skip += 1
-                skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                  "reason": "sample_not_found", "detail": ""})
+                for _, row in group.iterrows():
+                    processed += 1
+                    skip += 1
+                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": int(row["window_idx"]),
+                                      "reason": "sample_not_found", "detail": ""})
+                    if processed == 1 or processed == total_candidates or processed % interval == 0:
+                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
                 continue
             try: ppg, acc = load_ppg(sample), load_acc(sample)
             except Exception as exc:
-                skip += 1
-                skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                  "reason": "load_signal_failed", "detail": str(exc)})
+                for _, row in group.iterrows():
+                    processed += 1
+                    skip += 1
+                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": int(row["window_idx"]),
+                                      "reason": "load_signal_failed", "detail": str(exc)})
+                    if processed == 1 or processed == total_candidates or processed % interval == 0:
+                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
                 continue
             try:
-                score = float(row["score"]) if pd.notna(row["score"]) else -2000.0
-                if is_prewindowed_signal(ppg):
-                    mode = detect_green_mode(ppg)
-                    if widx >= ppg.shape[0]:
-                        skip += 1
-                        skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                          "reason": "window_index_out_of_bounds", "detail": f"n_windows={ppg.shape[0]}"})
-                        continue
-                    win25, _ = _prewindow_to_25hz(sample, ppg[widx], 5.0)
-                    ir, amb, g1, g2, g3 = get_channels_from_window(win25, mode)
-                    feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
-                else:
-                    ppg25, acc25, _ = _to_25hz(sample, ppg, acc); mode = detect_green_mode(ppg)
+                mode = detect_green_mode(ppg)
+                prewindowed = is_prewindowed_signal(ppg)
+                if not prewindowed:
+                    ppg25, acc25, _ = _to_25hz(sample, ppg, acc)
                     sw, ss = int(round(5.0 * FEATURE_FS)), int(round(1.0 * FEATURE_FS))
-                    if widx * ss + sw > len(ppg25):
-                        skip += 1
-                        skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                          "reason": "window_slice_out_of_range", "detail": f"signal_len={len(ppg25)}"})
-                        continue
-                    win = ppg25[widx * ss:widx * ss + sw, :]
-                    ir, amb, g1, g2, g3 = get_channels_from_window(win, mode)
-                    feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
-                target = int(row["target"])
-                r = {"sample_name": sn, "target": target, "should_veto": int(target == 0),
-                     "commercial_pred": int(row["pred"]), "window_idx": widx,
-                     "commercial_score": score, "is_error": int(row["is_error"])}
-                r.update(feats); rows.append(r); ok += 1
             except Exception as exc:
-                skip += 1
-                skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
-                                  "reason": "feature_extraction_failed", "detail": str(exc)})
+                for _, row in group.iterrows():
+                    processed += 1
+                    skip += 1
+                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": int(row["window_idx"]),
+                                      "reason": "sample_preprocess_failed", "detail": str(exc)})
+                    if processed == 1 or processed == total_candidates or processed % interval == 0:
+                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
+                continue
+            for _, row in group.iterrows():
+                processed += 1
+                widx = int(row["window_idx"])
+                try:
+                    score = float(row["score"]) if pd.notna(row["score"]) else -2000.0
+                    if prewindowed:
+                        if widx >= ppg.shape[0]:
+                            skip += 1
+                            skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                              "reason": "window_index_out_of_bounds", "detail": f"n_windows={ppg.shape[0]}"})
+                            continue
+                        win25, _ = _prewindow_to_25hz(sample, ppg[widx], 5.0)
+                        ir, amb, g1, g2, g3 = get_channels_from_window(win25, mode)
+                        feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
+                    else:
+                        if widx * ss + sw > len(ppg25):
+                            skip += 1
+                            skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                              "reason": "window_slice_out_of_range", "detail": f"signal_len={len(ppg25)}"})
+                            continue
+                        win = ppg25[widx * ss:widx * ss + sw, :]
+                        ir, amb, g1, g2, g3 = get_channels_from_window(win, mode)
+                        feats = extract_feature_pool_from_window(ir, amb, g1, g2, g3, fs=FEATURE_FS)
+                    target = int(row["target"])
+                    r = {"sample_name": sn, "target": target, "should_veto": int(target == 0),
+                         "commercial_pred": int(row["pred"]), "window_idx": widx,
+                         "commercial_score": score, "is_error": int(row["is_error"])}
+                    r.update(feats); rows.append(r); ok += 1
+                except Exception as exc:
+                    skip += 1
+                    skip_rows.append({"split": name, "sample_name": sn, "window_idx": widx,
+                                      "reason": "feature_extraction_failed", "detail": str(exc)})
+                finally:
+                    if processed == 1 or processed == total_candidates or processed % interval == 0:
+                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
         print(f"[{name}] Extracted={ok} skipped={skip}")
         df = pd.DataFrame(rows)
         if rows:

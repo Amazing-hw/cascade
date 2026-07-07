@@ -1,0 +1,7 @@
+# Commercial Filter Report
+
+- rows: 28
+- samples: 4
+- stage2_enabled_rows: 28
+- commercial_positive_rows: 14
+- errors: 28

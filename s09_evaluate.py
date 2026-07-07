@@ -43,6 +43,26 @@ def apply_corrector(score, new_feats, bundle):
     return float(bundle["model"].predict_proba(X)[0, 1])
 
 
+def build_feature_matrix(df, features, fills):
+    if not features:
+        return np.empty((len(df), 0), dtype=float)
+    matrix = df.reindex(columns=features)
+    matrix = matrix.apply(pd.to_numeric, errors="coerce")
+    X = matrix.to_numpy(dtype=float)
+    for i, feature in enumerate(features):
+        invalid = ~np.isfinite(X[:, i])
+        X[invalid, i] = fills.get(feature, 0.0)
+    return X
+
+
+def predict_corrector_many(df, bundle):
+    if bundle.get("constant_probability") is not None:
+        return np.full(len(df), float(bundle["constant_probability"]), dtype=float)
+    feats, fills = bundle["selected_features"], bundle["fill_values"]
+    X = build_feature_matrix(df, feats, fills)
+    return np.asarray(bundle["model"].predict_proba(X)[:, 1], dtype=float)
+
+
 def metric(yt, yp):
     cm = confusion_matrix(yt, yp, labels=[0, 1]); tn, fp, fn, tp = cm.ravel()
     return {"n": len(yt), "accuracy": float(accuracy_score(yt, yp)),
@@ -117,6 +137,91 @@ def apply_guard_decision(commercial_pred, veto_risks, guard_mode="shadow", veto_
     )["final_pred"]
 
 
+def _normal_window_mask(df):
+    if "fallback" not in df.columns:
+        return pd.Series(True, index=df.index)
+    raw = df["fallback"].fillna(False)
+    if raw.dtype == bool:
+        return ~raw
+    text = raw.astype(str).str.strip().str.lower()
+    return ~text.isin(["1", "true", "yes", "y"])
+
+
+def _commercial_probabilities(df):
+    if "score" in df.columns:
+        com = OldLivenessModel()
+        scores = pd.to_numeric(df["score"], errors="coerce")
+        probs = scores.apply(lambda x: com.score_to_probability(float(x)) if np.isfinite(x) else np.nan)
+        if probs.notna().any():
+            return probs.fillna(0.0).to_numpy(dtype=float)
+    if "pred" in df.columns:
+        return pd.to_numeric(df["pred"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    if "commercial_pred" in df.columns:
+        return pd.to_numeric(df["commercial_pred"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    return np.zeros(len(df), dtype=float)
+
+
+def evaluate_cached_feature_rows(
+    commercial_df,
+    feature_df,
+    bundle,
+    guard_mode="shadow",
+    min_veto_windows=2,
+    min_veto_ratio=0.4,
+):
+    if len(commercial_df) == 0:
+        return []
+    work = commercial_df.copy()
+    feats = feature_df.copy() if feature_df is not None else pd.DataFrame()
+    thr = float(bundle["threshold"])
+    results = []
+    for sn, group in work.groupby("sample_name"):
+        target = int(pd.to_numeric(group["target"], errors="coerce").dropna().iloc[0])
+        normal = group[_normal_window_mask(group)]
+        if len(normal) == 0:
+            results.append({"sample_name": sn, "target": target, "commercial_pred": 0,
+                            "cascade_pred": 0, "bypass_pred": 0, "fallback": True})
+            continue
+        cp = int(np.mean(_commercial_probabilities(normal)) >= 0.5)
+        feature_group = feats[feats["sample_name"] == sn] if "sample_name" in feats.columns else pd.DataFrame()
+        if len(feature_group) > 0:
+            feature_group = feature_group[_normal_window_mask(feature_group)]
+        Pcas = predict_corrector_many(feature_group, bundle) if len(feature_group) > 0 else np.asarray([0.0])
+        decision = make_guard_decision(
+            cp, Pcas, guard_mode=guard_mode, veto_threshold=thr,
+            min_veto_windows=min_veto_windows, min_veto_ratio=min_veto_ratio
+        )
+        results.append({"sample_name": sn, "target": target, "commercial_pred": cp,
+                        "cascade_pred": decision["final_pred"], "bypass_pred": cp,
+                        "veto_risk": decision["veto_risk"], "risk_count": decision["risk_count"],
+                        "window_count": decision["window_count"], "risk_ratio": decision["risk_ratio"],
+                        "guard_action": decision["guard_action"],
+                        "decision_source": decision["decision_source"],
+                        "guard_mode": guard_mode, "fallback": False})
+    return results
+
+
+def write_evaluation_outputs(artifact_dir, split, guard_mode, min_veto_windows, min_veto_ratio, results):
+    cm = metric([r["target"] for r in results], [r["commercial_pred"] for r in results])
+    casm = metric([r["target"] for r in results], [r["cascade_pred"] for r in results])
+    disc = [r for r in results if r["commercial_pred"] != r["cascade_pred"]]
+    fixed = sum(1 for d in disc if d["cascade_pred"] == d["target"] and d["commercial_pred"] != d["target"])
+    broken = sum(1 for d in disc if d["commercial_pred"] == d["target"] and d["cascade_pred"] != d["target"])
+    print(f"Commercial: acc={cm['accuracy']:.4f} prec={cm['precision']:.4f} rec={cm['recall']:.4f} f1={cm['f1']:.4f}")
+    print(f"Cascade:    acc={casm['accuracy']:.4f} prec={casm['precision']:.4f} rec={casm['recall']:.4f} f1={casm['f1']:.4f}")
+    print(f"Disagreements: {len(disc)}/{len(results)} (fixed={fixed}, broken={broken})")
+    report = {"split": split, "n": len(results), "guard_mode": guard_mode,
+              "min_veto_windows": min_veto_windows, "min_veto_ratio": min_veto_ratio,
+              "commercial": cm, "cascade": casm, "bypass": cm,
+              "n_disagreements": len(disc), "fixed": fixed, "broken": broken}
+    with open(os.path.join(artifact_dir, "evaluation_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    pd.DataFrame(results).to_csv(os.path.join(artifact_dir, "evaluation_samples.csv"), index=False)
+    pd.DataFrame([{"metric": m, "commercial": cm[m], "cascade": casm[m], "delta": casm[m] - cm[m]}
+                  for m in ["accuracy", "precision", "recall", "f1"]])\
+      .to_csv(os.path.join(artifact_dir, "evaluation_comparison.csv"), index=False)
+
+
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--artifact_dir", default="artifacts/cascade")
     p.add_argument("--splits_dir", default="artifacts"); p.add_argument("--split", default="test")
@@ -127,6 +232,28 @@ def main():
     os.makedirs(args.artifact_dir, exist_ok=True)
     splits = load_splits(args.splits_dir); samples = splits[args.split]
     bundle = joblib.load(os.path.join(args.artifact_dir, "corrector_bundle.pkl"))
+    t0 = time.time()
+    commercial_path = os.path.join(args.artifact_dir, f"commercial_results_{args.split}.csv")
+    feature_path = os.path.join(args.artifact_dir, f"error_features_{args.split}.csv")
+    if os.path.exists(commercial_path):
+        print(f"Using cached commercial results: {commercial_path}")
+        if os.path.exists(feature_path):
+            print(f"Using cached error features: {feature_path}")
+            feature_df = pd.read_csv(feature_path)
+        else:
+            print(f"Cached error features not found: {feature_path}; evaluating commercial-only risk=0")
+            feature_df = pd.DataFrame()
+        results = evaluate_cached_feature_rows(
+            pd.read_csv(commercial_path), feature_df, bundle, guard_mode=args.guard_mode,
+            min_veto_windows=args.min_veto_windows, min_veto_ratio=args.min_veto_ratio
+        )
+        print(f"Inference ({time.time()-t0:.1f}s)")
+        write_evaluation_outputs(
+            args.artifact_dir, args.split, args.guard_mode,
+            args.min_veto_windows, args.min_veto_ratio, results
+        )
+        print("Done")
+        return
     com = OldLivenessModel(); thr = bundle["threshold"]; t0 = time.time(); results = []
     for sample in samples:
         sn, target = sample.get("sample_name", "unknown"), int(sample.get("target", 0))

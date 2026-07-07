@@ -562,6 +562,14 @@ artifacts/cascade/skipped_error_features_test.csv
 
 `skipped_error_features_*.csv` 会记录商用阳性候选窗口没有成功抽取特征的原因，例如样本未找到、信号读取失败、窗口越界或特征抽取失败。它用于解释 hard negative 候选数和最终 `error_features_*.csv` 行数不一致的情况。
 
+运行时终端会显示候选窗口级进度：
+
+```text
+[train] candidates 28/56 ( 50.0%) speed=81.16/s eta=0s ok=28 skipped=0
+```
+
+这里的 `candidates` 是商用模型判为佩戴、且 Stage2 已启用的窗口数；`ok` 是成功抽取新增特征的候选窗口数；`skipped` 会同步写入 `skipped_error_features_*.csv`。脚本会按 `sample_name` 分组处理，同一个 H5 样本只加载一次，避免一个样本多个候选窗口时重复读取原始数据。
+
 ### `s07_select_features.py`
 
 为新增小模型选择特征。
@@ -571,6 +579,8 @@ artifacts/cascade/skipped_error_features_test.csv
 - 只从数值特征中选。
 - 自动排除标签、预测结果和泄漏字段。
 - 输出 ranked feature 和人工选择模板。
+- 支持 `--n_workers`，会传入底层稳定性选择的 fold 任务；运行时会打印每个 fold 的进度。
+- 支持输入哈希缓存。若 `error_features_train.csv`、`error_features_valid.csv` 和关键参数未变化，会直接复用 `selected_features.json` 与 `feature_review/`，跳过耗时的稳定性选择。
 
 输出：
 
@@ -580,6 +590,7 @@ artifacts/cascade/feature_review/ranked_features.csv
 artifacts/cascade/feature_review/ranked_features.json
 artifacts/cascade/feature_review/ranked_features.md
 artifacts/cascade/feature_review/manual_feature_selection_template.json
+artifacts/cascade/feature_review/selection_cache.json
 ```
 
 ### `s08_train_corrector.py`
@@ -633,7 +644,7 @@ bypass_pred      回退模式输出，等于商用输出
 自动生成或读取 splits.json
 S05 运行商用模型
 S06 提取商用阳性候选和 hard negative
-S07 选择特征
+S07 选择特征，可通过 --n_workers 加速稳定性选择
 S08 训练小 XGBoost / constant guard
 S09 评估
 S11 可解释性报告，可选
@@ -707,11 +718,13 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --dry_run
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain
 ```
 
-指定 worker 数运行。`--n_workers` 会用于首次扫描 H5 数据，也会传给 `S05` 做样本级并行：
+指定 worker 数运行。`--n_workers` 会用于首次扫描 H5 数据，也会传给 `S05` 做样本级并行，并传给 `S07` 加速稳定性选择：
 
 ```bash
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 4
 ```
+
+`S06-Extract errors` 默认按样本分组复用 H5 加载，并在终端输出候选窗口进度；它不需要额外参数即可看到进度。
 
 如果数据量较小，建议保持默认或显式使用串行，避免多进程启动开销：
 

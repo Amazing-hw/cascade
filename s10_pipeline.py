@@ -163,12 +163,14 @@ def main():
     ]
     if args.n_workers is not None:
         s05_args += ["--n_workers", str(args.n_workers)]
+    s07_args = ["--artifact_dir", paths["artifact_dir"], "--max_features", str(args.max_features)]
+    if args.n_workers is not None:
+        s07_args += ["--n_workers", str(args.n_workers)]
     steps = [
         ("S05-Run commercial", os.path.join(d, "s05_run_commercial.py"), s05_args),
         ("S06-Extract errors", os.path.join(d, "s06_extract_errors.py"),
          ["--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"]]),
-        ("S07-Select features", os.path.join(d, "s07_select_features.py"),
-         ["--artifact_dir", paths["artifact_dir"], "--max_features", str(args.max_features)]),
+        ("S07-Select features", os.path.join(d, "s07_select_features.py"), s07_args),
         ("S08-Train corrector", os.path.join(d, "s08_train_corrector.py"), train_args),
         ("S09-Evaluate", os.path.join(d, "s09_evaluate.py"),
          ["--artifact_dir", paths["artifact_dir"], "--splits_dir", paths["splits_dir"], "--split", args.eval_split,
