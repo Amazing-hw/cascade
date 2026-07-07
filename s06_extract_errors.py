@@ -18,6 +18,8 @@ from s04_data import load_splits, multiprocessing_context_from_env, resolve_n_wo
 
 FEATURE_FS = 25
 MIN_AUTO_PARALLEL_GROUPS = 32
+MIN_CHUNKED_MAP_GROUPS = 200
+_THREADPOOL_LIMITER = None
 
 
 def _format_duration(seconds):
@@ -55,6 +57,28 @@ def _resolve_s06_workers(n_workers, total):
             return 1
         return resolve_n_workers(None, n_items=total)
     return resolve_n_workers(n_workers, n_items=total)
+
+
+def _init_feature_worker():
+    """Limit nested BLAS/NumExpr threads inside each process-pool worker."""
+    global _THREADPOOL_LIMITER
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+        _THREADPOOL_LIMITER = threadpool_limits(limits=1)
+    except Exception:
+        _THREADPOOL_LIMITER = None
+
+
+def _parallel_chunksize(total, n_workers):
+    return max(1, int(total) // max(1, int(n_workers) * 8))
+
+
+def _use_chunked_map(total, n_workers):
+    return int(n_workers) > 1 and int(total) >= MIN_CHUNKED_MAP_GROUPS
 
 
 def build_hard_negative_summary(df, split):
@@ -299,24 +323,40 @@ def main():
         n_workers = _resolve_s06_workers(args.n_workers, len(groups))
         print(f"[{name}] candidates={total_candidates}, samples={len(groups)}, workers={n_workers}", flush=True)
         if n_workers > 1 and len(groups) > 1:
-            pool_kwargs = {"max_workers": n_workers}
+            pool_kwargs = {"max_workers": n_workers, "initializer": _init_feature_worker}
             mp_ctx = multiprocessing_context_from_env()
             if mp_ctx is not None:
                 pool_kwargs["mp_context"] = mp_ctx
+            use_chunked = _use_chunked_map(len(groups), n_workers)
+            chunksize = _parallel_chunksize(len(groups), n_workers)
+            if use_chunked:
+                print(f"[{name}] group map chunksize={chunksize}", flush=True)
             with ProcessPoolExecutor(**pool_kwargs) as executor:
-                futures = [
-                    executor.submit(_s06_group_worker, (name, sn, records, sample))
-                    for sn, records, sample in groups
-                ]
-                for future in as_completed(futures):
-                    result = future.result()
-                    rows.extend(result["rows"])
-                    skip_rows.extend(result["skip_rows"])
-                    ok += int(result["ok"])
-                    skip += int(result["skip"])
-                    processed += int(result["processed"])
-                    if processed == total_candidates or processed % interval == 0 or processed - int(result["processed"]) == 0:
-                        _print_progress(name, processed, total_candidates, split_t0, ok, skip)
+                if use_chunked:
+                    args_iter = ((name, sn, records, sample) for sn, records, sample in groups)
+                    result_iter = executor.map(_s06_group_worker, args_iter, chunksize=chunksize)
+                    for result in result_iter:
+                        rows.extend(result["rows"])
+                        skip_rows.extend(result["skip_rows"])
+                        ok += int(result["ok"])
+                        skip += int(result["skip"])
+                        processed += int(result["processed"])
+                        if processed == total_candidates or processed % interval == 0 or processed - int(result["processed"]) == 0:
+                            _print_progress(name, processed, total_candidates, split_t0, ok, skip)
+                else:
+                    futures = [
+                        executor.submit(_s06_group_worker, (name, sn, records, sample))
+                        for sn, records, sample in groups
+                    ]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        rows.extend(result["rows"])
+                        skip_rows.extend(result["skip_rows"])
+                        ok += int(result["ok"])
+                        skip += int(result["skip"])
+                        processed += int(result["processed"])
+                        if processed == total_candidates or processed % interval == 0 or processed - int(result["processed"]) == 0:
+                            _print_progress(name, processed, total_candidates, split_t0, ok, skip)
         else:
             for sn, records, sample in groups:
                 result = _process_candidate_group(name, sn, records, sample)

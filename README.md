@@ -777,6 +777,15 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode sh
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 4
 ```
 
+并行策略是保守设计，适合在 Windows、Linux 和服务器环境中稳定运行：
+
+- `S05` 按完整 H5 样本并行运行冻结商用模型，不按窗口切分，避免同一个样本被反复读取。
+- `S06` 按 `sample_name` 分组并行抽取商用阳性候选特征，同一个样本内多个候选窗口会复用一次 H5 读取。
+- 样本或候选组数量较小时保持串行，避免多进程启动成本超过收益。
+- 大样本场景下会自动使用 `executor.map(..., chunksize=...)` 降低大量 future 调度开销。
+- 每个 worker 内会限制 BLAS/NumExpr 线程数，避免 `多进程 x 多线程` 抢占 CPU 导致变慢。
+- 稳定性选择阶段会把训练矩阵一次性放入 worker，全局复用，只在 fold 任务中传索引，减少重复序列化。
+
 特征筛选和稳定性选择耗时很长时，可以显式使用快速配置：
 
 ```bash
