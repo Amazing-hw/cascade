@@ -5,7 +5,7 @@ S08: Train tiny XGBoost veto guard on commercial-positive candidates.
 Output: {artifact_dir}/corrector_model.json, corrector_bundle.pkl
 """
 
-import argparse, json, os, sys, time
+import argparse, hashlib, json, os, platform, sys, time
 import numpy as np, pandas as pd, xgboost as xgb, joblib
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 
@@ -16,6 +16,37 @@ LEAKAGE_FEATURES = {
     "is_error",
     "fallback",
 }
+
+
+def sha256_head(path, head_bytes=4 * 1024 * 1024):
+    if not path or not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(head_bytes))
+    return h.hexdigest()
+
+
+def build_training_fingerprint(artifact_dir, feature_pool_train_path=None, splits_path=None):
+    fingerprint = {
+        "train_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "xgboost": xgb.__version__,
+        "splits_sha256_head": sha256_head(splits_path or os.path.join(os.path.dirname(artifact_dir), "splits.json")),
+        "feature_pool_train_sha256_head": sha256_head(
+            feature_pool_train_path or os.path.join(artifact_dir, "feature_pool_train.csv")
+        ),
+        "selection_policy": {
+            "selection_data": "train_only",
+            "valid_used_for_selection": False,
+            "test_used_for_selection": False,
+            "test_role": "final_closed_evaluation_only",
+        },
+    }
+    return fingerprint
 
 
 class ConstantProbabilityModel:
@@ -103,6 +134,12 @@ def main():
     tp = os.path.join(args.artifact_dir, "error_features_train.csv")
     vp = os.path.join(args.artifact_dir, "error_features_valid.csv")
     if not os.path.exists(tp): print("ERROR: train not found"); sys.exit(1)
+    fingerprint = build_training_fingerprint(
+        args.artifact_dir,
+        os.path.join(args.artifact_dir, "feature_pool_train.csv") if os.path.exists(os.path.join(args.artifact_dir, "feature_pool_train.csv")) else tp,
+    )
+    with open(os.path.join(args.artifact_dir, "model_fingerprint.json"), "w", encoding="utf-8") as f:
+        json.dump(fingerprint, f, indent=2, ensure_ascii=False)
     dt = pd.read_csv(tp); dv = pd.read_csv(vp) if os.path.exists(vp) else dt.copy()
     label_col = "should_veto" if "should_veto" in dt.columns else "target"
     np_, nn_ = int(dt[label_col].sum()), len(dt) - int(dt[label_col].sum())
@@ -120,6 +157,7 @@ def main():
                "n_estimators": 0, "max_depth": 0, "n_nodes": 0,
                "threshold_objective": "constant_single_class_fallback",
                "feature_source": feature_source,
+               "fingerprint": fingerprint,
                "selected_features": feats, "threshold": float(thr),
                "fill_values": {k: float(v) for k, v in fills.items()},
                "train_metrics": tm, "valid_metrics": vm}
@@ -127,7 +165,7 @@ def main():
             json.dump(cfg, f, indent=2)
         joblib.dump({"model": None, "selected_features": feats, "threshold": thr,
                      "fill_values": fills, "constant_probability": constant_probability,
-                     "config": cfg},
+                     "fingerprint": fingerprint, "config": cfg},
                     os.path.join(args.artifact_dir, "corrector_bundle.pkl"))
         print(f"Constant guard fallback: probability={constant_probability:.3f}, reason=single_class_training_labels")
         print(f"Done ({time.time()-t0:.1f}s)")
@@ -150,9 +188,11 @@ def main():
            "threshold_objective": "veto_precision_constrained", "min_veto_precision": 0.95,
            "threshold_selection": best,
            "feature_source": feature_source,
+           "fingerprint": fingerprint,
            "selected_features": feats, "threshold": float(thr),
            "fill_values": {k: float(v) for k, v in fills.items()}, "train_metrics": tm, "valid_metrics": vm}
-    joblib.dump({"model": model, "selected_features": feats, "threshold": thr, "fill_values": fills, "config": cfg},
+    joblib.dump({"model": model, "selected_features": feats, "threshold": thr, "fill_values": fills,
+                 "fingerprint": fingerprint, "config": cfg},
                 os.path.join(args.artifact_dir, "corrector_bundle.pkl"))
     print(f"Done ({time.time()-t0:.1f}s)")
 

@@ -118,6 +118,59 @@ def write_skip_report(artifact_dir, split, rows):
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
+def feature_pool_path(artifact_dir, split):
+    return os.path.join(artifact_dir, f"feature_pool_{split}.csv")
+
+
+def build_error_features_from_feature_pool(comm_candidates, feature_pool):
+    """Build cascade candidate rows from a cached feature_pool_*.csv when keys match."""
+    required = {"sample_name", "window_idx"}
+    if comm_candidates is None or feature_pool is None:
+        return None
+    if not required.issubset(comm_candidates.columns) or not required.issubset(feature_pool.columns):
+        return None
+
+    comm = comm_candidates.copy()
+    pool = feature_pool.copy()
+    comm["window_idx"] = pd.to_numeric(comm["window_idx"], errors="coerce").astype("Int64")
+    pool["window_idx"] = pd.to_numeric(pool["window_idx"], errors="coerce").astype("Int64")
+    comm = comm.dropna(subset=["window_idx"])
+    pool = pool.dropna(subset=["window_idx"])
+    if comm.empty or pool.empty:
+        return None
+    comm["window_idx"] = comm["window_idx"].astype(int)
+    pool["window_idx"] = pool["window_idx"].astype(int)
+
+    pool_value_cols = [c for c in pool.columns if c not in {"sample_name", "window_idx"}]
+    if not pool_value_cols:
+        return None
+    pool["_feature_pool_hit"] = 1
+    meta_cols = ["sample_name", "window_idx", "target", "pred", "score", "is_error"]
+    meta = comm[[c for c in meta_cols if c in comm.columns]].copy()
+    merged = meta.merge(pool, on=["sample_name", "window_idx"], how="left", suffixes=("_comm", ""))
+    if len(merged) != len(comm) or "_feature_pool_hit" not in merged or merged["_feature_pool_hit"].isna().any():
+        return None
+    merged = merged.drop(columns=["_feature_pool_hit"])
+
+    if "target_comm" in merged.columns:
+        merged["target"] = merged["target_comm"]
+        merged = merged.drop(columns=["target_comm"])
+    if "target" not in merged.columns and "target_comm" in merged.columns:
+        merged["target"] = merged["target_comm"]
+    if "target" not in merged.columns:
+        return None
+    if merged["target"].isna().any():
+        return None
+
+    merged["target"] = pd.to_numeric(merged["target"], errors="coerce").fillna(0).astype(int)
+    merged["should_veto"] = (merged["target"] == 0).astype(int)
+    merged["commercial_pred"] = pd.to_numeric(merged.get("pred", 1), errors="coerce").fillna(1).astype(int)
+    merged["commercial_score"] = pd.to_numeric(merged.get("score", -2000.0), errors="coerce").fillna(-2000.0)
+    merged["is_error"] = pd.to_numeric(merged.get("is_error", merged["should_veto"]), errors="coerce").fillna(merged["should_veto"]).astype(int)
+    merged = merged.drop(columns=[c for c in ["pred", "score"] if c in merged.columns])
+    return merged
+
+
 def _prewindow_to_25hz(sample, window, window_sec):
     n = int(window.shape[0])
     if (_is_25hz_sample(sample) or n == int(round(float(window_sec) * FEATURE_FS))
@@ -224,6 +277,16 @@ def main():
             write_skip_report(args.artifact_dir, name, [])
             write_hard_negative_audit(args.artifact_dir, name, pd.DataFrame())
             continue
+        fp = feature_pool_path(args.artifact_dir, name)
+        if os.path.exists(fp):
+            cached_df = build_error_features_from_feature_pool(errors, pd.read_csv(fp))
+            if cached_df is not None:
+                cached_df.to_csv(os.path.join(args.artifact_dir, f"error_features_{name}.csv"), index=False)
+                write_skip_report(args.artifact_dir, name, [])
+                write_hard_negative_audit(args.artifact_dir, name, cached_df)
+                print(f"[{name}] Reused cached feature pool: {fp} rows={len(cached_df)}")
+                continue
+            print(f"[{name}] Cached feature pool not usable, falling back to H5 extraction: {fp}")
         rows, skip_rows, ok, skip = [], [], 0, 0
         total_candidates = len(errors)
         interval = _progress_interval(total_candidates)
@@ -268,6 +331,7 @@ def main():
         df = pd.DataFrame(rows)
         if rows:
             df.to_csv(os.path.join(args.artifact_dir, f"error_features_{name}.csv"), index=False)
+            df.to_csv(fp, index=False)
         write_skip_report(args.artifact_dir, name, skip_rows)
         write_hard_negative_audit(args.artifact_dir, name, df)
     print(f"Done ({time.time()-t0:.1f}s)")

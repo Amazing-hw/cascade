@@ -67,12 +67,21 @@ python s10_pipeline.py --dataset_dir path\to\dataset --guard_mode shadow
 python s10_pipeline.py --dataset_dir path\to\dataset --guard_mode shadow --explain
 ```
 
+需要额外生成特征池可解释性汇报图时再加：
+
+```bash
+python s10_pipeline.py --dataset_dir path\to\dataset --guard_mode shadow --feature_report
+```
+
 运行结束后先看这几个文件：
 
 ```text
 artifacts/cascade/commercial_model_manifest.json
 artifacts/cascade/evaluation_report.json
 artifacts/cascade/evaluation_comparison.csv
+artifacts/cascade/feature_pool_train.csv
+artifacts/cascade/model_fingerprint.json
+artifacts/cascade/feature_report/
 artifacts/cascade/feature_review/ranked_features.md
 artifacts/cascade/hard_negative_audit/
 ```
@@ -465,6 +474,24 @@ PPG/ACC 特征提取模块。
 - 部署友好特征白名单。
 - 特征池生成工具。
 
+新增特征池当前采用“可解释性优先”的过滤策略。绿光 PPG 会先形成三路输入 `g1/g2/g3`：普通三绿光数据直接取三个绿光通道；多路绿光数据会按同一物理位置的多颗绿光求平均，合并成 3 个方位通道。后续新增模型主要使用以下几类容易解释的特征：
+
+- 绿光强度和稳定性：例如 `G_mean_mean`、`GREEN_AC_MAD`、`GREEN_AC_DC_RATIO`、`GREEN_SEG_ACDC_CV`。
+- 三通道一致性：例如 `G_ch_dc_cv`、`GCH_DC_RANGE_RATIO`、`GCH_AC_RANGE_RATIO`、`G_2OF3_AC_SUPPORT`、`G_TOP2_CORR_MIN`。
+- TOP2 绿光聚合：用三通道中 AC 更好的两路形成稳健绿光，保留 `GTOP2_AC_MAD`、`GTOP2_AC_DC_RATIO`、`GTOP2_SEG_ACDC_CV` 等。
+- 环境光关系：例如 `AMB_AC_TO_GREEN_AC`、`AMB_DC_TO_GREEN_DC`、`GREEN_AMB_BP_CORR`、`GREEN_AMB_LEAK`，用于解释“外界光泄漏/遮挡变化”。
+- ACC 运动强度：例如 `ACC_MAG_STD`、`ACC_DIFF_MAD`、`ACC_STILL_SCORE`、`ACC_GREEN_BP_CORR`，用于解释“静止/运动与 PPG 是否匹配”。
+
+为了让后续树模型和汇报材料更容易解释，当前会从新增候选池和部署白名单中剔除以下特征族：
+
+- 熵类和 Hjorth 类：如 `*_Entropy_*`、`*_Hjorth_*`，数学含义偏抽象，不利于业务解释。
+- 偏度/峰度类：如 `*_bp_skewness`、`*_bp_kurtosis`，对异常波形敏感，阈值不好解释。
+- 空间向量几何类：如 `G_spatial_vmag_*`、`G_SPATIAL_VMAG_RANGE`，三通道合并后更推荐用通道差异、相关性和支持数解释。
+- 硬件编号/角度类：如 `G_MIN_CHANNEL_ID`、`G_DROPOUT_ANGLE`、`G_TOP2_WORST_IDX`，容易绑定设备布局。
+- 复合打分类：如 `G_SPATIAL_STABILITY_SCORE`、`ACC_STILL_GREEN_MISMATCH`，由多个概念相乘或相除，难以在上线评审中解释单一物理意义。
+
+人工选择特征时，建议优先选择能用一句话解释的特征，例如“绿光 AC/DC 太低”“三通道只有 1 路支持”“环境光和绿光同步泄漏”“ACC 很静止但 PPG 不稳定”。如果一个特征必须依赖复杂数学概念才能解释，即使排序靠前，也不建议进入最终小 XGBoost。
+
 当前 Stage1 默认阈值：
 
 ```text
@@ -554,6 +581,9 @@ should_veto = 1 when target == 0 among commercial-positive candidates
 artifacts/cascade/error_features_train.csv
 artifacts/cascade/error_features_valid.csv
 artifacts/cascade/error_features_test.csv
+artifacts/cascade/feature_pool_train.csv
+artifacts/cascade/feature_pool_valid.csv
+artifacts/cascade/feature_pool_test.csv
 artifacts/cascade/hard_negative_audit/*
 artifacts/cascade/skipped_error_features_train.csv
 artifacts/cascade/skipped_error_features_valid.csv
@@ -569,6 +599,8 @@ artifacts/cascade/skipped_error_features_test.csv
 ```
 
 这里的 `candidates` 是商用模型判为佩戴、且 Stage2 已启用的窗口数；`ok` 是成功抽取新增特征的候选窗口数；`skipped` 会同步写入 `skipped_error_features_*.csv`。脚本会按 `sample_name` 分组处理，同一个 H5 样本只加载一次，避免一个样本多个候选窗口时重复读取原始数据。
+
+`S06` 会同时维护 `feature_pool_train.csv`、`feature_pool_valid.csv`、`feature_pool_test.csv` 作为候选窗口特征池缓存。再次运行时，如果这些缓存能和当前 `commercial_results_*.csv` 的 `sample_name + window_idx` 对齐，`S06` 会直接复用缓存生成 `error_features_*.csv` 和 hard negative 审计报告，不再重新读取 H5 和抽取同一批 PPG/ACC 特征。缓存不匹配或不存在时，会自动回退到原始 H5 抽取路径。
 
 ### `s07_select_features.py`
 
@@ -703,7 +735,21 @@ README_DEPLOY.md
 deploy_manifest.json
 ```
 
-`method.json` 是核心方法配置，包含特征顺序、缺失值填充值、阈值、guard 模式、串联策略和商用模型冻结信息。
+`method.json` 是核心方法配置，包含特征顺序、缺失值填充值、阈值、guard 模式、串联策略、训练 fingerprint 和商用模型冻结信息。
+
+### `s13_feature_report.py`
+
+特征池可解释性报告脚本。它只读取 `feature_pool_test.csv` 和 `selected_features.json`，不参与训练或调参，适合整理汇报材料。
+
+输出：
+
+```text
+artifacts/cascade/feature_report/feature_auc_ranking.csv
+artifacts/cascade/feature_report/feature_auc_ranking.png
+artifacts/cascade/feature_report/pca_2d.png
+artifacts/cascade/feature_report/selected_feature_correlation.png
+artifacts/cascade/feature_report/feature_report_summary.json
+```
 
 ## 7. 快速运行
 
@@ -748,6 +794,23 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode sh
 ```bash
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain --plot_mode basic
 ```
+
+如果某一步产物已经存在，可以用 `-skip` 或 `--skip` 跳过指定阶段。支持阶段号、脚本名和逗号分隔写法：
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow -skip s06
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain --skip s06,s11_explain.py
+```
+
+注意：跳过某阶段前要确认后续阶段依赖的产物已经存在。例如跳过 `S06` 时，应已有 `error_features_train.csv`、`error_features_valid.csv` 和 `error_features_test.csv`。
+
+如果只想重新做特征排序、人工特征选择、训练或评估，可以保留 `feature_pool_*.csv` 和 `error_features_*.csv`，然后跳过已经完成的慢步骤：
+
+```bash
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow -skip s05 -skip s06 --rank_only
+```
+
+如果只想避免 S06 重新从 H5 抽取候选特征，但仍希望根据当前商用结果重新生成 `error_features_*.csv`，则保留 `feature_pool_*.csv`，不要跳过 `s06`；S06 会优先复用缓存。
 
 如果要离线做更充分的排序复核，可以恢复旧的严格配置：
 
@@ -875,6 +938,10 @@ fallback
 
 商用模型冻结证据。用于确认商用模型参数、特征名和树结构哈希没有变化。
 
+### `model_fingerprint.json`
+
+新增守护模型的训练来源记录。包含训练时间、Python/numpy/pandas/xgboost 版本、`splits.json` 的 SHA256 摘要、`feature_pool_train.csv` 的 SHA256 摘要，以及 `test_used_for_selection=false` 的数据使用策略。部署导出时会一起写入 `method.json` 并拷贝到 `deploy_export/`。
+
 ### `commercial_results_*.csv`
 
 商用模型逐窗口输出。用于查看商用模型在哪些窗口启用 Stage2、哪些窗口判为佩戴、哪些窗口出错。
@@ -882,6 +949,20 @@ fallback
 ### `error_features_*.csv`
 
 串联守护模型的候选训练数据。只包含商用阳性且进入 Stage2 的候选窗口。
+
+### `feature_pool_*.csv`
+
+串联方案的候选窗口特征池缓存。它保存 `S06` 针对商用阳性候选窗口抽取出的新增 PPG/ACC 特征，并保留 `sample_name`、`window_idx`、`target`、`commercial_score`、`commercial_pred`、`should_veto` 等字段。
+
+这个缓存的作用是减少重复运行耗时：当 `feature_pool_*.csv` 已存在且能与当前 `commercial_results_*.csv` 对齐时，`S06` 会直接复用它生成 `error_features_*.csv` 和 hard negative 审计报告，不再重新读取 H5。
+
+### `feature_report/`
+
+特征池解释性报告。重点看：
+
+- `feature_auc_ranking.csv/png`：单特征区分度排序。
+- `pca_2d.png`：测试集样本在特征空间中的二维分布。
+- `selected_feature_correlation.png`：入选特征之间的相关性，辅助判断是否过度依赖重复信息。
 
 ### `hard_negative_audit/`
 
