@@ -667,6 +667,9 @@ artifacts/cascade/model_search_results.json
 ```text
 artifacts/cascade/evaluation_report.json
 artifacts/cascade/evaluation_samples.csv
+artifacts/cascade/evaluation_error_samples.csv
+artifacts/cascade/evaluation_fixed_samples.csv
+artifacts/cascade/evaluation_prediction_audit.csv
 artifacts/cascade/evaluation_comparison.csv
 artifacts/cascade/evaluation_confusion_matrices.csv
 artifacts/cascade/evaluation_guard_modes.csv
@@ -1040,6 +1043,24 @@ hard negative 审计报告。重点看：
 - veto risk。
 - guard action。
 - 是否 fallback。
+
+### `evaluation_error_samples.csv`
+
+最终完整方案仍然预测错误的样本清单，适合直接定位出错样本名。核心字段包括：
+
+- `sample_name`：样本名。
+- `target`：真实标签。
+- `commercial_pred`：只依赖商用模型的输出。
+- `final_pred`：串联完整方案最终输出。
+- `change_type`：错误来源，常见值为 `still_wrong` 或 `broken_by_full_scheme`。
+
+### `evaluation_fixed_samples.csv`
+
+商用模型预测错误、但串联完整方案修复正确的样本清单，`change_type=fixed_by_full_scheme`。
+
+### `evaluation_prediction_audit.csv`
+
+全量样本审计表，包含正确样本、最终错误样本和被修复样本，适合后续按 `change_type`、`guard_action`、`decision_source` 做分组统计。
 
 ### `evaluation_confusion_matrices.csv`
 

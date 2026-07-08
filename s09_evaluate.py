@@ -88,6 +88,62 @@ def print_confusion_matrix(title, metrics):
     print(f"  true_1      {int(c['FN']):6d}  {int(c['TP']):6d}")
 
 
+ERROR_SAMPLE_COLUMNS = [
+    "sample_name", "target", "commercial_pred", "final_pred",
+    "commercial_wrong", "final_wrong", "change_type", "guard_action",
+    "decision_source", "guard_mode", "fallback", "veto_risk", "risk_count",
+    "window_count", "risk_ratio",
+]
+
+
+def _prediction_audit_rows(results, final_key):
+    rows = []
+    for r in results:
+        target = int(r.get("target", 0))
+        commercial_pred = int(r.get("commercial_pred", 0))
+        final_pred = int(r.get(final_key, commercial_pred))
+        commercial_wrong = commercial_pred != target
+        final_wrong = final_pred != target
+        if final_wrong and commercial_wrong:
+            change_type = "still_wrong"
+        elif final_wrong:
+            change_type = "broken_by_full_scheme"
+        elif commercial_wrong:
+            change_type = "fixed_by_full_scheme"
+        else:
+            change_type = "correct"
+        rows.append({
+            "sample_name": r.get("sample_name", ""),
+            "target": target,
+            "commercial_pred": commercial_pred,
+            "final_pred": final_pred,
+            "commercial_wrong": bool(commercial_wrong),
+            "final_wrong": bool(final_wrong),
+            "change_type": change_type,
+            "guard_action": r.get("guard_action", ""),
+            "decision_source": r.get("decision_source", ""),
+            "guard_mode": r.get("guard_mode", ""),
+            "fallback": bool(r.get("fallback", False)),
+            "veto_risk": r.get("veto_risk", ""),
+            "risk_count": r.get("risk_count", ""),
+            "window_count": r.get("window_count", ""),
+            "risk_ratio": r.get("risk_ratio", ""),
+        })
+    return rows
+
+
+def write_error_sample_outputs(artifact_dir, results, final_key):
+    rows = _prediction_audit_rows(results, final_key)
+    audit = pd.DataFrame(rows, columns=ERROR_SAMPLE_COLUMNS)
+    audit[audit["final_wrong"] == True].to_csv(
+        os.path.join(artifact_dir, "evaluation_error_samples.csv"), index=False
+    )
+    audit[audit["change_type"] == "fixed_by_full_scheme"].to_csv(
+        os.path.join(artifact_dir, "evaluation_fixed_samples.csv"), index=False
+    )
+    audit.to_csv(os.path.join(artifact_dir, "evaluation_prediction_audit.csv"), index=False)
+
+
 GUARD_MODES = ("bypass", "shadow", "soft_guard", "hard_veto")
 
 
@@ -301,6 +357,7 @@ def write_evaluation_outputs(artifact_dir, split, guard_mode, min_veto_windows, 
     with open(os.path.join(artifact_dir, "evaluation_report.json"), "w") as f:
         json.dump(report, f, indent=2)
     pd.DataFrame(results).to_csv(os.path.join(artifact_dir, "evaluation_samples.csv"), index=False)
+    write_error_sample_outputs(artifact_dir, results, "cascade_pred")
     pd.DataFrame([{"metric": m, "commercial": cm[m], "cascade": casm[m], "delta": casm[m] - cm[m]}
                   for m in ["accuracy", "precision", "recall", "f1"]])\
       .to_csv(os.path.join(artifact_dir, "evaluation_comparison.csv"), index=False)
