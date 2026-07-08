@@ -149,6 +149,7 @@ def main():
     p.add_argument("--n_workers", type=int, default=None)
     p.add_argument("--force_split", action="store_true")
     p.add_argument("--dc_threshold", type=float, default=0.3e6)
+    p.add_argument("--min_features", type=int, default=4)
     p.add_argument("--max_features", type=int, default=10)
     p.add_argument("--preselect_top", type=int, default=4)
     p.add_argument("--stability_splits", type=int, default=4)
@@ -190,6 +191,8 @@ def main():
         print(f"[TIMING] S04-Split data: {split_elapsed:.1f}s / {format_duration(split_elapsed)}")
 
     train_args = ["--artifact_dir", paths["artifact_dir"], "--n_estimators", str(args.n_estimators), "--max_depth", str(args.max_depth)]
+    if args.n_workers is not None:
+        train_args += ["--n_jobs", str(args.n_workers)]
     if args.manual_features:
         train_args += ["--manual_features", _abs_path(args.manual_features, d)]
     s05_args = [
@@ -201,6 +204,7 @@ def main():
     s07_args = [
         "--artifact_dir", paths["artifact_dir"],
         "--max_features", str(args.max_features),
+        "--min_features", str(args.min_features),
         "--preselect_top", str(args.preselect_top),
         "--stability_splits", str(args.stability_splits),
         "--stability_seeds", args.stability_seeds,

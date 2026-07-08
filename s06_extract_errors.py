@@ -81,11 +81,85 @@ def _use_chunked_map(total, n_workers):
     return int(n_workers) > 1 and int(total) >= MIN_CHUNKED_MAP_GROUPS
 
 
+def _normal_bool_series(series, default=False):
+    if series is None:
+        return pd.Series(default, dtype=bool)
+    if series.dtype == bool:
+        return series.fillna(default)
+    text = series.fillna(default).astype(str).str.strip().str.lower()
+    return text.isin(["1", "true", "yes", "y"])
+
+
+def build_cascade_training_candidates(comm, include_positive_keep=True):
+    if comm is None or len(comm) == 0:
+        return pd.DataFrame()
+    df = comm.copy()
+    pred = pd.to_numeric(df.get("pred", 0), errors="coerce").fillna(0).astype(int)
+    target = pd.to_numeric(df.get("target", 0), errors="coerce").fillna(0).astype(int)
+    stage2 = _normal_bool_series(df.get("stage2_enabled", pd.Series(True, index=df.index)), default=True)
+    fallback = _normal_bool_series(df.get("fallback", pd.Series(False, index=df.index)), default=False)
+    base_mask = (~fallback) & stage2
+    veto_mask = base_mask & (pred == 1)
+    if include_positive_keep:
+        keep_mask = base_mask & (target == 1)
+        mask = veto_mask | keep_mask
+    else:
+        mask = veto_mask
+    out = df.loc[mask].copy()
+    if len(out) == 0:
+        return out
+    out["target"] = pd.to_numeric(out["target"], errors="coerce").fillna(0).astype(int)
+    out["should_veto"] = (out["target"] == 0).astype(int)
+    out["candidate_role"] = np.where(out["should_veto"] == 1, "veto_negative", "keep_positive")
+    return out
+
+
+def build_candidate_health_summary(df, split):
+    if df is None or len(df) == 0:
+        return {
+            "split": split,
+            "total_candidates": 0,
+            "unique_samples": 0,
+            "should_veto_1": 0,
+            "should_veto_0": 0,
+            "commercial_positive_candidates": 0,
+            "positive_keep_candidates": 0,
+            "is_single_class": True,
+        }
+    target = pd.to_numeric(df.get("target", pd.Series(0, index=df.index)), errors="coerce").fillna(0).astype(int)
+    should_veto = pd.to_numeric(df.get("should_veto", (target == 0).astype(int)), errors="coerce").fillna(0).astype(int)
+    pred = pd.to_numeric(df.get("pred", df.get("commercial_pred", pd.Series(0, index=df.index))), errors="coerce").fillna(0).astype(int)
+    return {
+        "split": split,
+        "total_candidates": int(len(df)),
+        "unique_samples": int(df["sample_name"].nunique()) if "sample_name" in df.columns else 0,
+        "should_veto_1": int((should_veto == 1).sum()),
+        "should_veto_0": int((should_veto == 0).sum()),
+        "commercial_positive_candidates": int((pred == 1).sum()),
+        "positive_keep_candidates": int((target == 1).sum()),
+        "is_single_class": bool(should_veto.nunique() < 2),
+    }
+
+
+def write_candidate_health_report(artifact_dir, split, df):
+    out_dir = os.path.join(artifact_dir, "candidate_health")
+    os.makedirs(out_dir, exist_ok=True)
+    summary = build_candidate_health_summary(df, split)
+    pd.DataFrame([summary]).to_csv(os.path.join(out_dir, f"candidate_health_{split}.csv"), index=False)
+    with open(os.path.join(out_dir, f"candidate_health_{split}.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    if summary["is_single_class"]:
+        print(f"[{split}] WARNING: cascade candidates are single-class: {summary}", flush=True)
+    else:
+        print(f"[{split}] candidate health: {summary}", flush=True)
+    return summary
+
+
 def build_hard_negative_summary(df, split):
     if df is None or len(df) == 0:
         return {
             "split": split,
-            "candidate_source": "commercial_positive_stage2_enabled",
+            "candidate_source": "cascade_training_candidates_commercial_positive_plus_positive_keep",
             "total_candidates": 0,
             "hard_negative_candidates": 0,
             "worn_positive_candidates": 0,
@@ -101,7 +175,7 @@ def build_hard_negative_summary(df, split):
     hard_samples = int(df.loc[should_veto == 1, "sample_name"].nunique()) if "sample_name" in df else 0
     return {
         "split": split,
-        "candidate_source": "commercial_positive_stage2_enabled",
+        "candidate_source": "cascade_training_candidates_commercial_positive_plus_positive_keep",
         "total_candidates": total,
         "hard_negative_candidates": hard,
         "worn_positive_candidates": int((target == 1).sum()),
@@ -295,9 +369,10 @@ def main():
         cp = os.path.join(args.artifact_dir, f"commercial_results_{name}.csv")
         if not os.path.exists(cp): print(f"[{name}] Skipped"); continue
         comm = pd.read_csv(cp)
-        errors = comm[(comm["pred"] == 1) & (comm["fallback"] == False) & (comm["stage2_enabled"] == True)]
+        errors = build_cascade_training_candidates(comm, include_positive_keep=True)
+        write_candidate_health_report(args.artifact_dir, name, errors)
         if len(errors) == 0:
-            print(f"[{name}] No commercial-positive candidates")
+            print(f"[{name}] No cascade training candidates")
             write_skip_report(args.artifact_dir, name, [])
             write_hard_negative_audit(args.artifact_dir, name, pd.DataFrame())
             continue
@@ -329,6 +404,7 @@ def main():
                 pool_kwargs["mp_context"] = mp_ctx
             use_chunked = _use_chunked_map(len(groups), n_workers)
             chunksize = _parallel_chunksize(len(groups), n_workers)
+            print(f"[{name}] process pool mp_start={mp_ctx.get_start_method()}", flush=True)
             if use_chunked:
                 print(f"[{name}] group map chunksize={chunksize}", flush=True)
             with ProcessPoolExecutor(**pool_kwargs) as executor:

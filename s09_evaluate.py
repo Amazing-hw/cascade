@@ -91,6 +91,67 @@ def print_confusion_matrix(title, metrics):
 GUARD_MODES = ("bypass", "shadow", "soft_guard", "hard_veto")
 
 
+def _row_pred_for_guard_mode(row, mode, min_veto_windows=2, min_veto_ratio=0.4):
+    commercial_pred = int(row.get("commercial_pred", 0))
+    if mode in {"bypass", "shadow", "soft_guard"} or commercial_pred == 0:
+        return commercial_pred
+    risk_count = int(row.get("risk_count", 0) or 0)
+    risk_ratio = float(row.get("risk_ratio", 0.0) or 0.0)
+    if risk_count >= int(min_veto_windows) and risk_ratio >= float(min_veto_ratio):
+        return 0
+    return commercial_pred
+
+
+def evaluate_all_guard_modes_from_rows(rows, pred_key="cascade_pred", min_veto_windows=2, min_veto_ratio=0.4):
+    results = {}
+    y_true = [int(r.get("target", 0)) for r in rows]
+    commercial_pred = [int(r.get("commercial_pred", 0)) for r in rows]
+    for mode in GUARD_MODES:
+        y_pred = [_row_pred_for_guard_mode(r, mode, min_veto_windows, min_veto_ratio) for r in rows]
+        metrics = metric(y_true, y_pred) if rows else metric([], [])
+        disagreements = [i for i, (c, p) in enumerate(zip(commercial_pred, y_pred)) if c != p]
+        fixed = sum(1 for i in disagreements if y_pred[i] == y_true[i] and commercial_pred[i] != y_true[i])
+        broken = sum(1 for i in disagreements if commercial_pred[i] == y_true[i] and y_pred[i] != y_true[i])
+        results[mode] = {
+            "metrics": metrics,
+            "n_disagreements": int(len(disagreements)),
+            "fixed": int(fixed),
+            "broken": int(broken),
+        }
+    return results
+
+
+def write_guard_mode_comparison(artifact_dir, rows, pred_key="cascade_pred", min_veto_windows=2, min_veto_ratio=0.4):
+    comparison = evaluate_all_guard_modes_from_rows(
+        rows,
+        pred_key=pred_key,
+        min_veto_windows=min_veto_windows,
+        min_veto_ratio=min_veto_ratio,
+    )
+    out_rows = []
+    for mode, payload in comparison.items():
+        metrics = payload["metrics"]
+        out_rows.append({
+            "guard_mode": mode,
+            "n": metrics["n"],
+            "accuracy": metrics["accuracy"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+            "TN": metrics["confusion"]["TN"],
+            "FP": metrics["confusion"]["FP"],
+            "FN": metrics["confusion"]["FN"],
+            "TP": metrics["confusion"]["TP"],
+            "n_disagreements": payload["n_disagreements"],
+            "fixed": payload["fixed"],
+            "broken": payload["broken"],
+        })
+    pd.DataFrame(out_rows).to_csv(os.path.join(artifact_dir, "evaluation_guard_modes.csv"), index=False)
+    with open(os.path.join(artifact_dir, "evaluation_guard_modes.json"), "w", encoding="utf-8") as f:
+        json.dump(comparison, f, indent=2)
+    return comparison
+
+
 def _summarize_risks(veto_risks, veto_threshold):
     arr = np.asarray(veto_risks, dtype=float).reshape(-1)
     arr = arr[np.isfinite(arr)]
@@ -228,9 +289,14 @@ def write_evaluation_outputs(artifact_dir, split, guard_mode, min_veto_windows, 
     print(f"Cascade:    acc={casm['accuracy']:.4f} prec={casm['precision']:.4f} rec={casm['recall']:.4f} f1={casm['f1']:.4f}")
     print_confusion_matrix("Cascade final", casm)
     print(f"Disagreements: {len(disc)}/{len(results)} (fixed={fixed}, broken={broken})")
+    guard_mode_comparison = write_guard_mode_comparison(
+        artifact_dir, results, pred_key="cascade_pred",
+        min_veto_windows=min_veto_windows, min_veto_ratio=min_veto_ratio,
+    )
     report = {"split": split, "n": len(results), "guard_mode": guard_mode,
               "min_veto_windows": min_veto_windows, "min_veto_ratio": min_veto_ratio,
               "commercial": cm, "cascade": casm, "bypass": cm,
+              "guard_mode_comparison": guard_mode_comparison,
               "n_disagreements": len(disc), "fixed": fixed, "broken": broken}
     with open(os.path.join(artifact_dir, "evaluation_report.json"), "w") as f:
         json.dump(report, f, indent=2)

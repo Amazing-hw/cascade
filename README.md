@@ -585,6 +585,7 @@ artifacts/cascade/feature_pool_train.csv
 artifacts/cascade/feature_pool_valid.csv
 artifacts/cascade/feature_pool_test.csv
 artifacts/cascade/hard_negative_audit/*
+artifacts/cascade/candidate_health/*
 artifacts/cascade/skipped_error_features_train.csv
 artifacts/cascade/skipped_error_features_valid.csv
 artifacts/cascade/skipped_error_features_test.csv
@@ -633,13 +634,18 @@ artifacts/cascade/feature_review/selection_cache.json
 
 训练串联守护模型。
 
-默认模型：
+训练方式：
 
 ```text
-XGBoost
-n_estimators = 10
-max_depth = 2
+默认先做小范围 XGBoost 参数搜参，再用 valid 集选择最终模型。
+
+默认搜索空间保持很小：
+n_estimators = 6, 8, 10, 12, 16, 20
+max_depth = 1, 2, 3
+learning_rate = 0.03, 0.05
 ```
+
+搜参目标不是追求复杂模型，而是在不明显增加部署成本的前提下，选择更稳的浅树模型。`commercial_score` 和人工确认后的新增特征保持不变，搜索只发生在新增守护模型参数上，不影响商用模型。
 
 如果训练标签只有一个类别，会退化为 constant probability guard，避免训练崩溃。
 
@@ -648,6 +654,8 @@ max_depth = 2
 ```text
 artifacts/cascade/corrector_model.json
 artifacts/cascade/corrector_bundle.pkl
+artifacts/cascade/model_search_results.csv
+artifacts/cascade/model_search_results.json
 ```
 
 ### `s09_evaluate.py`
@@ -661,6 +669,8 @@ artifacts/cascade/evaluation_report.json
 artifacts/cascade/evaluation_samples.csv
 artifacts/cascade/evaluation_comparison.csv
 artifacts/cascade/evaluation_confusion_matrices.csv
+artifacts/cascade/evaluation_guard_modes.csv
+artifacts/cascade/evaluation_guard_modes.json
 ```
 
 核心对比：
@@ -681,8 +691,8 @@ bypass_pred      回退模式输出，等于商用输出
 自动生成或读取 splits.json
 S05 运行商用模型
 S06 提取商用阳性候选和 hard negative
-S07 选择特征，可通过 --n_workers、--rank_only、--permutation_repeats 加速
-S08 训练小 XGBoost / constant guard
+S07 选择特征，可通过 --n_workers、--rank_only、--permutation_repeats 加速，并可用 --min_features 设置最少保留特征数
+S08 小范围搜参并训练小 XGBoost / constant guard
 S09 评估
 S11 可解释性报告，可选
 ```
@@ -771,7 +781,7 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --dry_run
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --explain
 ```
 
-指定 worker 数运行。`--n_workers` 会用于首次扫描 H5 数据，也会传给 `S05` 做样本级并行，传给 `S06` 做候选样本并行，并传给 `S07` 加速稳定性选择：
+指定 worker 数运行。`--n_workers` 会用于首次扫描 H5 数据，也会传给 `S05` 做样本级并行，传给 `S06` 做候选样本并行，传给 `S07` 加速稳定性选择，并在 `S08` 中转换为 XGBoost 的 `--n_jobs`：
 
 ```bash
 python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 4
@@ -784,7 +794,9 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode sh
 - 样本或候选组数量较小时保持串行，避免多进程启动成本超过收益。
 - 大样本场景下会自动使用 `executor.map(..., chunksize=...)` 降低大量 future 调度开销。
 - 每个 worker 内会限制 BLAS/NumExpr 线程数，避免 `多进程 x 多线程` 抢占 CPU 导致变慢。
+- Linux/macOS 下默认使用 `spawn` 启动子进程，避免 HDF5、NumPy/SciPy、XGBoost 在 `fork` 模式下偶发死锁；如需实验性覆盖，可设置环境变量 `WL_MP_START_METHOD=forkserver` 或 `WL_MP_START_METHOD=fork`。
 - 稳定性选择阶段会把训练矩阵一次性放入 worker，全局复用，只在 fold 任务中传索引，减少重复序列化。
+- `S08` 是单个 XGBoost 搜参/训练脚本，不使用 `ProcessPoolExecutor`；pipeline 会把 `--n_workers 4` 传成 `s08_train_corrector.py --n_jobs 4`，用于 XGBoost 内部线程并行。
 
 特征筛选和稳定性选择耗时很长时，可以显式使用快速配置：
 
@@ -795,7 +807,7 @@ python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode sh
 如果当前目标只是先得到特征排序和人工选择模板，建议使用更快的排序模式：
 
 ```bash
-python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 4 --rank_only --permutation_repeats 1
+python s10_pipeline.py --dataset_dir D:\wearing_liveness\dataset --guard_mode shadow --n_workers 4 --rank_only --permutation_repeats 1 --min_features 5
 ```
 
 如果需要解释性图片但暂时不需要树结构和错误路径细节，可以使用 basic 绘图模式：
