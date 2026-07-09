@@ -264,7 +264,7 @@ def main():
     os.makedirs(args.artifact_dir, exist_ok=True)
     tp = os.path.join(args.artifact_dir, "error_features_train.csv")
     if not os.path.exists(tp):
-        print(f"ERROR: {tp} not found")
+        print(f"ERROR: {tp} not found. Run S06 first, or check that --artifact_dir is shared across S05/S06/S07.")
         sys.exit(1)
     vp = os.path.join(args.artifact_dir, "error_features_valid.csv")
     input_paths = [tp] + ([vp] if os.path.exists(vp) else [])
@@ -288,6 +288,13 @@ def main():
     t0 = time.time()
     dt = pd.read_csv(tp)
     dv = pd.read_csv(vp) if os.path.exists(vp) else dt.copy()
+    if dt.empty:
+        print(
+            f"ERROR: {tp} has no cascade training candidates. "
+            "The commercial model produced no Stage2-enabled positive candidates for train; "
+            "review candidate_health/candidate_health_train.json or run in bypass/shadow mode with more data."
+        )
+        sys.exit(1)
     fcols = get_candidate_feature_cols(dt)
     dtc, dvc, kept, _, _ = clean_features_by_train(dt, dv, fcols, missing_thresh=0.5, corr_thresh=0.95, skip_vif=True)
     stability_df = limit_rows_for_stability(dtc, max_rows=args.stability_max_rows)

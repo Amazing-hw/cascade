@@ -216,6 +216,30 @@ def write_skip_report(artifact_dir, split, rows):
     pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
+def write_empty_error_features(artifact_dir, split, candidates=None):
+    """Keep the S06 output contract even when a split has no candidates."""
+    cols = [
+        "sample_name",
+        "target",
+        "should_veto",
+        "commercial_pred",
+        "window_idx",
+        "commercial_score",
+        "is_error",
+        "candidate_role",
+    ]
+    if candidates is not None and len(getattr(candidates, "columns", [])) > 0:
+        optional = {
+            "pred": "commercial_pred",
+            "score": "commercial_score",
+        }
+        renamed = [optional.get(c, c) for c in candidates.columns]
+        cols = cols + [c for c in renamed if c not in cols and c not in {"stage2_enabled", "fallback"}]
+    path = os.path.join(artifact_dir, f"error_features_{split}.csv")
+    pd.DataFrame(columns=cols).to_csv(path, index=False)
+    return path
+
+
 def feature_pool_path(artifact_dir, split):
     return os.path.join(artifact_dir, f"feature_pool_{split}.csv")
 
@@ -367,12 +391,17 @@ def main():
     t0 = time.time()
     for name in ["train", "valid", "test"]:
         cp = os.path.join(args.artifact_dir, f"commercial_results_{name}.csv")
-        if not os.path.exists(cp): print(f"[{name}] Skipped"); continue
+        if not os.path.exists(cp):
+            raise FileNotFoundError(
+                f"{cp} not found. Run S05 first, or check that --artifact_dir is the same for S05/S06/S08."
+            )
         comm = pd.read_csv(cp)
         errors = build_cascade_training_candidates(comm, include_positive_keep=True)
         write_candidate_health_report(args.artifact_dir, name, errors)
         if len(errors) == 0:
             print(f"[{name}] No cascade training candidates")
+            out_path = write_empty_error_features(args.artifact_dir, name, errors)
+            print(f"[{name}] Wrote empty S06 output: {out_path}")
             write_skip_report(args.artifact_dir, name, [])
             write_hard_negative_audit(args.artifact_dir, name, pd.DataFrame())
             continue
@@ -448,6 +477,9 @@ def main():
         if rows:
             df.to_csv(os.path.join(args.artifact_dir, f"error_features_{name}.csv"), index=False)
             df.to_csv(fp, index=False)
+        else:
+            out_path = write_empty_error_features(args.artifact_dir, name, errors)
+            print(f"[{name}] Wrote empty S06 output: {out_path}")
         write_skip_report(args.artifact_dir, name, skip_rows)
         write_hard_negative_audit(args.artifact_dir, name, df)
     print(f"Done ({time.time()-t0:.1f}s)")

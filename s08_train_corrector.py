@@ -445,7 +445,9 @@ def main():
     )
     tp = os.path.join(args.artifact_dir, "error_features_train.csv")
     vp = os.path.join(args.artifact_dir, "error_features_valid.csv")
-    if not os.path.exists(tp): print("ERROR: train not found"); sys.exit(1)
+    if not os.path.exists(tp):
+        print(f"ERROR: {tp} not found. Run S06 first, or check that --artifact_dir is shared across S05/S06/S08.")
+        sys.exit(1)
     fingerprint = build_training_fingerprint(
         args.artifact_dir,
         os.path.join(args.artifact_dir, "feature_pool_train.csv") if os.path.exists(os.path.join(args.artifact_dir, "feature_pool_train.csv")) else tp,
@@ -453,6 +455,13 @@ def main():
     with open(os.path.join(args.artifact_dir, "model_fingerprint.json"), "w", encoding="utf-8") as f:
         json.dump(fingerprint, f, indent=2, ensure_ascii=False)
     dt = pd.read_csv(tp); dv = pd.read_csv(vp) if os.path.exists(vp) else dt.copy()
+    if dt.empty:
+        print(
+            f"ERROR: {tp} has no cascade training candidates. "
+            "The commercial model produced no Stage2-enabled positive candidates for train; "
+            "review candidate_health/candidate_health_train.json before training the cascade corrector."
+        )
+        sys.exit(1)
     label_col = "should_veto" if "should_veto" in dt.columns else "target"
     np_, nn_ = int(dt[label_col].sum()), len(dt) - int(dt[label_col].sum())
     sw = max(0.5, nn_ / max(1, np_)) if np_ > 0 else 1.0
