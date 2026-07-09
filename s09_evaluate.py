@@ -270,6 +270,18 @@ def apply_guard_decision(commercial_pred, veto_risks, guard_mode="shadow", veto_
     )["final_pred"]
 
 
+def resolve_guard_params_from_bundle(bundle, min_veto_windows=None, min_veto_ratio=None):
+    config = bundle.get("config", {}) if isinstance(bundle, dict) else {}
+    sample_guard = config.get("sample_guard", {}) if isinstance(config, dict) else {}
+    resolved_windows = min_veto_windows
+    resolved_ratio = min_veto_ratio
+    if resolved_windows is None:
+        resolved_windows = int(sample_guard.get("min_veto_windows", 2))
+    if resolved_ratio is None:
+        resolved_ratio = float(sample_guard.get("min_veto_ratio", 0.4))
+    return int(resolved_windows), float(resolved_ratio)
+
+
 def _normal_window_mask(df):
     if "fallback" not in df.columns:
         return pd.Series(True, index=df.index)
@@ -370,12 +382,16 @@ def main():
     p = argparse.ArgumentParser(); p.add_argument("--artifact_dir", default="artifacts/cascade")
     p.add_argument("--splits_dir", default="artifacts"); p.add_argument("--split", default="test")
     p.add_argument("--guard_mode", default="shadow", choices=GUARD_MODES)
-    p.add_argument("--min_veto_windows", type=int, default=2)
-    p.add_argument("--min_veto_ratio", type=float, default=0.4)
+    p.add_argument("--min_veto_windows", type=int, default=None)
+    p.add_argument("--min_veto_ratio", type=float, default=None)
     args = p.parse_args()
     os.makedirs(args.artifact_dir, exist_ok=True)
     splits = load_splits(args.splits_dir); samples = splits[args.split]
     bundle = joblib.load(os.path.join(args.artifact_dir, "corrector_bundle.pkl"))
+    min_veto_windows, min_veto_ratio = resolve_guard_params_from_bundle(
+        bundle, args.min_veto_windows, args.min_veto_ratio
+    )
+    print(f"Using guard params: min_veto_windows={min_veto_windows}, min_veto_ratio={min_veto_ratio}")
     t0 = time.time()
     commercial_path = os.path.join(args.artifact_dir, f"commercial_results_{args.split}.csv")
     feature_path = os.path.join(args.artifact_dir, f"error_features_{args.split}.csv")
@@ -389,12 +405,12 @@ def main():
             feature_df = pd.DataFrame()
         results = evaluate_cached_feature_rows(
             pd.read_csv(commercial_path), feature_df, bundle, guard_mode=args.guard_mode,
-            min_veto_windows=args.min_veto_windows, min_veto_ratio=args.min_veto_ratio
+            min_veto_windows=min_veto_windows, min_veto_ratio=min_veto_ratio
         )
         print(f"Inference ({time.time()-t0:.1f}s)")
         write_evaluation_outputs(
             args.artifact_dir, args.split, args.guard_mode,
-            args.min_veto_windows, args.min_veto_ratio, results
+            min_veto_windows, min_veto_ratio, results
         )
         print("Done")
         return
@@ -438,7 +454,7 @@ def main():
         cp = int(np.mean(Pc) >= 0.5) if Pc else 0
         decision = make_guard_decision(
             cp, Pcas if Pcas else [0.0], guard_mode=args.guard_mode, veto_threshold=thr,
-            min_veto_windows=args.min_veto_windows, min_veto_ratio=args.min_veto_ratio
+            min_veto_windows=min_veto_windows, min_veto_ratio=min_veto_ratio
         )
         casp = decision["final_pred"]
         results.append({"sample_name": sn, "target": target, "commercial_pred": cp, "cascade_pred": casp,
@@ -450,7 +466,7 @@ def main():
     print(f"Inference ({time.time()-t0:.1f}s)")
     write_evaluation_outputs(
         args.artifact_dir, args.split, args.guard_mode,
-        args.min_veto_windows, args.min_veto_ratio, results
+        min_veto_windows, min_veto_ratio, results
     )
     print("Done")
 

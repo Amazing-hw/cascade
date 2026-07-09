@@ -101,6 +101,121 @@ def evaluate(model, X, y, thr=0.5):
             "confusion": {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)}}
 
 
+def metric_from_sample_predictions(y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    return {
+        "n": int(len(y_true)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "confusion": {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)},
+    }
+
+
+def _parse_grid(raw, cast):
+    if isinstance(raw, (list, tuple)):
+        return [cast(x) for x in raw]
+    values = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part:
+            values.append(cast(part))
+    if not values:
+        raise ValueError(f"empty grid: {raw}")
+    return values
+
+
+def _sample_guard_frame(df):
+    rows = []
+    for sample_name, group in df.groupby("sample_name"):
+        target = int(pd.to_numeric(group["target"], errors="coerce").dropna().iloc[0])
+        commercial_pred = int(pd.to_numeric(group.get("commercial_pred", pd.Series([1] * len(group))), errors="coerce").fillna(1).mean() >= 0.5)
+        probs = pd.to_numeric(group["guard_probability"], errors="coerce").fillna(0.0).to_numpy(float)
+        rows.append({
+            "sample_name": sample_name,
+            "target": target,
+            "commercial_pred": commercial_pred,
+            "guard_probability": probs,
+        })
+    return rows
+
+
+def evaluate_sample_guard_params(sample_rows, guard_threshold, min_veto_windows, min_veto_ratio):
+    y_true, y_commercial, y_final = [], [], []
+    for row in sample_rows:
+        probs = np.asarray(row["guard_probability"], dtype=float)
+        high = probs >= float(guard_threshold)
+        risk_count = int(np.sum(high))
+        risk_ratio = float(np.mean(high)) if len(high) else 0.0
+        commercial_pred = int(row["commercial_pred"])
+        final_pred = commercial_pred
+        if (
+            commercial_pred == 1
+            and risk_count >= int(min_veto_windows)
+            and risk_ratio >= float(min_veto_ratio)
+        ):
+            final_pred = 0
+        y_true.append(int(row["target"]))
+        y_commercial.append(commercial_pred)
+        y_final.append(final_pred)
+    commercial_metrics = metric_from_sample_predictions(y_true, y_commercial)
+    metrics = metric_from_sample_predictions(y_true, y_final)
+    return metrics, commercial_metrics
+
+
+def search_sample_guard_params(
+    df,
+    guard_threshold,
+    min_veto_windows_values=None,
+    min_veto_ratio_values=None,
+    max_fn_increase=1,
+):
+    min_veto_windows_values = _parse_grid(min_veto_windows_values or "1,2,3", int)
+    min_veto_ratio_values = _parse_grid(min_veto_ratio_values or "0.2,0.3,0.4,0.5", float)
+    sample_rows = _sample_guard_frame(df)
+    if not sample_rows:
+        raise ValueError("no valid rows for sample guard search")
+    records = []
+    for min_veto_windows in min_veto_windows_values:
+        for min_veto_ratio in min_veto_ratio_values:
+            metrics, commercial = evaluate_sample_guard_params(
+                sample_rows, guard_threshold, min_veto_windows, min_veto_ratio
+            )
+            fp_reduction = commercial["confusion"]["FP"] - metrics["confusion"]["FP"]
+            fn_increase = metrics["confusion"]["FN"] - commercial["confusion"]["FN"]
+            score = (
+                10.0 * fp_reduction
+                - 6.0 * max(0, fn_increase)
+                + float(metrics["accuracy"])
+                + 0.2 * float(metrics["f1"])
+            )
+            if fn_increase > int(max_fn_increase):
+                score -= 100.0 + 10.0 * (fn_increase - int(max_fn_increase))
+            records.append({
+                "threshold": float(guard_threshold),
+                "min_veto_windows": int(min_veto_windows),
+                "min_veto_ratio": float(min_veto_ratio),
+                "score": float(score),
+                "fp_reduction": int(fp_reduction),
+                "fn_increase": int(fn_increase),
+                "metrics": metrics,
+                "commercial_metrics": commercial,
+            })
+    best = sorted(
+        records,
+        key=lambda r: (
+            -float(r["score"]),
+            int(r["fn_increase"]),
+            -int(r["fp_reduction"]),
+            int(r["min_veto_windows"]),
+            float(r["min_veto_ratio"]),
+        ),
+    )[0]
+    return records, best
+
+
 def parse_model_search_values(raw, cast, name):
     values = []
     for part in str(raw).split(","):
@@ -319,6 +434,9 @@ def main():
     p.add_argument("--model_search_max_candidates", type=int, default=32)
     p.add_argument("--model_search_random_state", type=int, default=42)
     p.add_argument("--model_search_size_cost", type=float, default=0.002)
+    p.add_argument("--search_min_veto_windows", default="1,2,3")
+    p.add_argument("--search_min_veto_ratios", default="0.2,0.3,0.4,0.5")
+    p.add_argument("--max_fn_increase", type=int, default=1)
     p.add_argument("--manual_features", default=None)
     args = p.parse_args()
     os.makedirs(args.artifact_dir, exist_ok=True)
@@ -350,6 +468,8 @@ def main():
                "constant_probability": constant_probability,
                "n_estimators": 0, "max_depth": 0, "n_jobs": max(1, int(args.n_jobs)), "n_nodes": 0,
                "threshold_objective": "constant_single_class_fallback",
+               "sample_guard": {"min_veto_windows": 2, "min_veto_ratio": 0.4,
+                                "search_enabled": False, "reason": "single_class_training_labels"},
                "feature_source": feature_source,
                "fingerprint": fingerprint,
                "selected_features": feats, "threshold": float(thr),
@@ -367,10 +487,35 @@ def main():
     model, best_record, model_search_summary = search_model(args, Xt, yt, Xv, yv, sw)
     pv = model.predict_proba(Xv)[:, 1]; best = select_veto_threshold(yv, pv, min_precision=0.95)
     thr = best["threshold"]; tm = evaluate(model, Xt, yt, thr); vm = evaluate(model, Xv, yv, thr)
+    guard_df = dv[["sample_name", "target"]].copy() if {"sample_name", "target"}.issubset(dv.columns) else pd.DataFrame({
+        "sample_name": [f"row_{i}" for i in range(len(dv))],
+        "target": dv[label_col].values.astype(int),
+    })
+    if "commercial_pred" in dv.columns:
+        guard_df["commercial_pred"] = pd.to_numeric(dv["commercial_pred"], errors="coerce").fillna(1).astype(int).values
+    else:
+        guard_df["commercial_pred"] = 1
+    guard_df["guard_probability"] = pv
+    guard_records, best_guard = search_sample_guard_params(
+        guard_df,
+        guard_threshold=thr,
+        min_veto_windows_values=args.search_min_veto_windows,
+        min_veto_ratio_values=args.search_min_veto_ratios,
+        max_fn_increase=args.max_fn_increase,
+    )
+    pd.DataFrame(guard_records).to_csv(os.path.join(args.artifact_dir, "sample_guard_search_results.csv"), index=False)
+    with open(os.path.join(args.artifact_dir, "sample_guard_search_results.json"), "w", encoding="utf-8") as f:
+        json.dump({"best": best_guard, "records": guard_records}, f, indent=2, ensure_ascii=False)
     nn = count_xgb_nodes(model)
     best_params = best_record["params"]
     print(f"Trees={best_params['n_estimators']} Depth={best_params['max_depth']} Nodes={nn} Thr={thr:.3f}")
     print(f"Threshold objective: veto precision>=0.95, precision={best['precision']:.4f}, recall={best['recall']:.4f}")
+    print(
+        "Best sample guard params: "
+        f"min_veto_windows={best_guard['min_veto_windows']}, "
+        f"min_veto_ratio={best_guard['min_veto_ratio']:.3f}, "
+        f"FP_reduction={best_guard['fp_reduction']}, FN_increase={best_guard['fn_increase']}"
+    )
     print(f"Train AUC={tm['auc']:.4f} F1={tm['f1']:.4f}  Valid AUC={vm['auc']:.4f} F1={vm['f1']:.4f}")
     model.get_booster().save_model(os.path.join(args.artifact_dir, "corrector_model.json"))
     cfg = {"model_type": "xgboost_veto_guard", "label_col": label_col,
@@ -379,6 +524,14 @@ def main():
            "model_search": model_search_summary,
            "threshold_objective": "veto_precision_constrained", "min_veto_precision": 0.95,
            "threshold_selection": best,
+           "sample_guard": {"search_enabled": True, "max_fn_increase": args.max_fn_increase,
+                            "selection_objective": "minimize false-wear FP first, constrain FN increase, then accuracy/F1",
+                            "min_veto_windows": best_guard["min_veto_windows"],
+                            "min_veto_ratio": best_guard["min_veto_ratio"],
+                            "best": best_guard,
+                            "candidate_count": len(guard_records),
+                            "grid": {"min_veto_windows": _parse_grid(args.search_min_veto_windows, int),
+                                     "min_veto_ratios": _parse_grid(args.search_min_veto_ratios, float)}},
            "feature_source": feature_source,
            "fingerprint": fingerprint,
            "selected_features": feats, "threshold": float(thr),

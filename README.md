@@ -647,6 +647,15 @@ learning_rate = 0.03, 0.05
 
 搜参目标不是追求复杂模型，而是在不明显增加部署成本的前提下，选择更稳的浅树模型。`commercial_score` 和人工确认后的新增特征保持不变，搜索只发生在新增守护模型参数上，不影响商用模型。
 
+模型训练完成后，还会在 valid 集上搜索样本级 hard veto 持续性规则：
+
+```text
+min_veto_windows: 默认 1,2,3
+min_veto_ratio:   默认 0.2,0.3,0.4,0.5
+```
+
+搜索目标优先降低 `target=0, pred=1`，也就是非佩戴被误判为佩戴；其次约束 `target=1, pred=0` 的增加；最后再比较 accuracy 和 F1。默认允许 `max_fn_increase=1`，可以通过 `--max_fn_increase` 调整。
+
 如果训练标签只有一个类别，会退化为 constant probability guard，避免训练崩溃。
 
 输出：
@@ -656,7 +665,11 @@ artifacts/cascade/corrector_model.json
 artifacts/cascade/corrector_bundle.pkl
 artifacts/cascade/model_search_results.csv
 artifacts/cascade/model_search_results.json
+artifacts/cascade/sample_guard_search_results.csv
+artifacts/cascade/sample_guard_search_results.json
 ```
+
+`corrector_bundle.pkl` 和 `corrector_model.json` 会记录最终采用的 `threshold`、`min_veto_windows` 和 `min_veto_ratio`。后续 `S09` 如果没有显式传入 `--min_veto_windows` 或 `--min_veto_ratio`，会默认读取这里的搜索结果。
 
 ### `s09_evaluate.py`
 
@@ -695,8 +708,8 @@ bypass_pred      回退模式输出，等于商用输出
 S05 运行商用模型
 S06 提取商用阳性候选和 hard negative
 S07 选择特征，可通过 --n_workers、--rank_only、--permutation_repeats 加速，并可用 --min_features 设置最少保留特征数
-S08 小范围搜参并训练小 XGBoost / constant guard
-S09 评估
+S08 小范围搜参并训练小 XGBoost / constant guard，并在 valid 集搜索样本级 veto 规则参数
+S09 评估，默认读取 S08 搜出的 veto 规则参数
 S11 可解释性报告，可选
 ```
 
@@ -917,12 +930,14 @@ risk_count >= min_veto_windows
 risk_ratio >= min_veto_ratio
 ```
 
-默认持续条件：
+默认持续条件来自 `S08` 在 valid 集上写入 `corrector_bundle.pkl` / `corrector_model.json` 的搜索结果：
 
 ```text
-min_veto_windows = 2
-min_veto_ratio = 0.4
+sample_guard.min_veto_windows
+sample_guard.min_veto_ratio
 ```
+
+如果旧版训练产物没有 `sample_guard` 字段，`S09` 才会回退到 `min_veto_windows=2`、`min_veto_ratio=0.4`。如果命令行显式传入 `--min_veto_windows` 或 `--min_veto_ratio`，则命令行参数优先，用于离线敏感性分析。
 
 注意：`hard_veto` 不建议直接全量商用，应该只用于离线评估或严格灰度。
 
@@ -1033,6 +1048,12 @@ hard negative 审计报告。重点看：
 ### `evaluation_report.json`
 
 评估摘要，包含商用基线和完整方案指标。
+
+### `sample_guard_search_results.csv/json`
+
+`S08` 的样本级 veto 规则参数搜索明细。每一行是一组候选参数，包含该参数在 valid 集上的混淆矩阵、FP 减少数量、FN 增加数量和综合分数。用于解释为什么最终选择某组 `min_veto_windows` 和 `min_veto_ratio`。
+
+最终选择结果会同时写入 `corrector_bundle.pkl` 和 `corrector_model.json` 的 `sample_guard` 字段，供 `S09` 评估和 `S12` 部署导出复用。
 
 ### `evaluation_samples.csv`
 

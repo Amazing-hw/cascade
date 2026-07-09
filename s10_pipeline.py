@@ -161,8 +161,11 @@ def main():
     p.add_argument("--max_depth", type=int, default=2)
     p.add_argument("--eval_split", default="test")
     p.add_argument("--guard_mode", default="shadow", choices=["bypass", "shadow", "soft_guard", "hard_veto"])
-    p.add_argument("--min_veto_windows", type=int, default=2)
-    p.add_argument("--min_veto_ratio", type=float, default=0.4)
+    p.add_argument("--min_veto_windows", type=int, default=None)
+    p.add_argument("--min_veto_ratio", type=float, default=None)
+    p.add_argument("--search_min_veto_windows", default="1,2,3")
+    p.add_argument("--search_min_veto_ratios", default="0.2,0.3,0.4,0.5")
+    p.add_argument("--max_fn_increase", type=int, default=1)
     p.add_argument("--manual_features", default=None)
     p.add_argument("--explain", action="store_true")
     p.add_argument("--feature_report", action="store_true",
@@ -191,6 +194,11 @@ def main():
         print(f"[TIMING] S04-Split data: {split_elapsed:.1f}s / {format_duration(split_elapsed)}")
 
     train_args = ["--artifact_dir", paths["artifact_dir"], "--n_estimators", str(args.n_estimators), "--max_depth", str(args.max_depth)]
+    train_args += [
+        "--search_min_veto_windows", args.search_min_veto_windows,
+        "--search_min_veto_ratios", args.search_min_veto_ratios,
+        "--max_fn_increase", str(args.max_fn_increase),
+    ]
     if args.n_workers is not None:
         train_args += ["--n_jobs", str(args.n_workers)]
     if args.manual_features:
@@ -218,15 +226,20 @@ def main():
     s06_args = ["--splits_dir", paths["splits_dir"], "--artifact_dir", paths["artifact_dir"]]
     if args.n_workers is not None:
         s06_args += ["--n_workers", str(args.n_workers)]
+    evaluate_args = [
+        "--artifact_dir", paths["artifact_dir"], "--splits_dir", paths["splits_dir"], "--split", args.eval_split,
+        "--guard_mode", args.guard_mode,
+    ]
+    if args.min_veto_windows is not None:
+        evaluate_args += ["--min_veto_windows", str(args.min_veto_windows)]
+    if args.min_veto_ratio is not None:
+        evaluate_args += ["--min_veto_ratio", str(args.min_veto_ratio)]
     steps = [
         ("S05-Run commercial", os.path.join(d, "s05_run_commercial.py"), s05_args),
         ("S06-Extract errors", os.path.join(d, "s06_extract_errors.py"), s06_args),
         ("S07-Select features", os.path.join(d, "s07_select_features.py"), s07_args),
         ("S08-Train corrector", os.path.join(d, "s08_train_corrector.py"), train_args),
-        ("S09-Evaluate", os.path.join(d, "s09_evaluate.py"),
-         ["--artifact_dir", paths["artifact_dir"], "--splits_dir", paths["splits_dir"], "--split", args.eval_split,
-          "--guard_mode", args.guard_mode, "--min_veto_windows", str(args.min_veto_windows),
-          "--min_veto_ratio", str(args.min_veto_ratio)]),
+        ("S09-Evaluate", os.path.join(d, "s09_evaluate.py"), evaluate_args),
     ]
     if args.explain:
         steps.append(("S11-Explain", os.path.join(d, "s11_explain.py"), [

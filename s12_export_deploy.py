@@ -106,21 +106,59 @@ def predict_guard_probability(feature_dict, package_dir="."):
     return float(booster.predict(xgb.DMatrix(x))[0])
 
 
-def apply_guard(commercial_pred, feature_dict, package_dir=".", guard_mode=None):
+def apply_guard_from_window_probabilities(commercial_pred, guard_probabilities, package_dir=".", guard_mode=None):
     method = load_method(package_dir)
     guard_mode = guard_mode or method["guard"]["default_mode"]
-    p_guard = predict_guard_probability(feature_dict, package_dir)
     threshold = float(method["model"]["threshold"])
     commercial_pred = int(commercial_pred)
 
-    if method["project_type"] == "cascade":
-        if commercial_pred == 0 or guard_mode in ("bypass", "shadow", "soft_guard"):
-            return {"final_pred": commercial_pred, "guard_probability": p_guard, "guard_action": "record"}
-        if guard_mode == "hard_veto" and p_guard >= threshold:
-            return {"final_pred": 0, "guard_probability": p_guard, "guard_action": "hard_veto"}
-        return {"final_pred": commercial_pred, "guard_probability": p_guard, "guard_action": "pass"}
+    if method["project_type"] != "cascade":
+        raise ValueError(f"unsupported project_type for this package: {method['project_type']}")
 
-    raise ValueError(f"unsupported project_type for this package: {method['project_type']}")
+    sample_guard = method["cascade"].get("sample_guard", {})
+    min_veto_windows = int(sample_guard.get("min_veto_windows", 2))
+    min_veto_ratio = float(sample_guard.get("min_veto_ratio", 0.4))
+    probs = np.asarray(guard_probabilities, dtype=float).reshape(-1)
+    probs = probs[np.isfinite(probs)]
+    if probs.size == 0:
+        probs = np.asarray([0.0], dtype=float)
+    high = probs >= threshold
+    risk_count = int(np.sum(high))
+    risk_ratio = float(np.mean(high))
+    should_veto = (
+        commercial_pred == 1
+        and risk_count >= min_veto_windows
+        and risk_ratio >= min_veto_ratio
+    )
+
+    if commercial_pred == 0 or guard_mode in ("bypass", "shadow", "soft_guard") or not should_veto:
+        return {
+            "final_pred": commercial_pred,
+            "guard_probability": float(np.max(probs)),
+            "guard_action": "record" if should_veto else "pass",
+            "risk_count": risk_count,
+            "risk_ratio": risk_ratio,
+        }
+    if guard_mode == "hard_veto":
+        return {
+            "final_pred": 0,
+            "guard_probability": float(np.max(probs)),
+            "guard_action": "hard_veto",
+            "risk_count": risk_count,
+            "risk_ratio": risk_ratio,
+        }
+    return {
+        "final_pred": commercial_pred,
+        "guard_probability": float(np.max(probs)),
+        "guard_action": "pass",
+        "risk_count": risk_count,
+        "risk_ratio": risk_ratio,
+    }
+
+
+def apply_guard(commercial_pred, feature_dict, package_dir=".", guard_mode=None):
+    p_guard = predict_guard_probability(feature_dict, package_dir)
+    return apply_guard_from_window_probabilities(commercial_pred, [p_guard], package_dir, guard_mode)
 '''
 
 
@@ -146,7 +184,9 @@ def readme_text():
 
 1. 商用模型仍然是主决策，新增模型只在商用阳性候选后做风险复核。
 2. 默认 `shadow` 不改变最终输出，只记录风险。
-3. 真正上线前应由端侧工程按 `method.json` 重写为目标语言实现，并用本目录文件做一致性核对。
+3. `method.json` 的 `cascade.sample_guard` 字段记录 valid 集搜索得到的 `min_veto_windows` 和 `min_veto_ratio`。
+4. 样本级部署时建议参考 `deploy_inference.py` 的 `apply_guard_from_window_probabilities()`，对同一样本的多个候选窗口概率一起判断持续性风险。
+5. 真正上线前应由端侧工程按 `method.json` 重写为目标语言实现，并用本目录文件做一致性核对。
 """
 
 
@@ -155,6 +195,7 @@ def build_method(artifact_dir, bundle, model_config):
     fill_values = {str(k): float(v) for k, v in bundle.get("fill_values", model_config.get("fill_values", {})).items()}
     threshold = float(bundle.get("threshold", model_config.get("threshold", 0.5)))
     constant_probability = bundle.get("constant_probability", model_config.get("constant_probability"))
+    sample_guard = model_config.get("sample_guard", {"min_veto_windows": 2, "min_veto_ratio": 0.4})
     method = {
         "project_type": PROJECT_TYPE,
         "package_version": 1,
@@ -186,7 +227,8 @@ def build_method(artifact_dir, bundle, model_config):
         },
         "cascade": {
             "guard_model_input": "commercial_positive_candidates",
-            "final_decision_rule": "default shadow keeps commercial_pred; hard_veto may set commercial-positive samples to 0 when guard probability reaches threshold",
+            "sample_guard": sanitize_config(sample_guard),
+            "final_decision_rule": "default shadow keeps commercial_pred; hard_veto may set commercial-positive samples to 0 when guard probability reaches threshold persistently",
             "most_important_risk": "false wearing positive",
         },
         "training_config": sanitize_config(model_config),
